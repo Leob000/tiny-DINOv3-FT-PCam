@@ -116,6 +116,18 @@ def time_latency(model, loader, device, warmup=20, iters=100, max_batches=0):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--eval_frac",
+        type=float,
+        default=0.25,
+        help="Fraction of an epoch between mid-epoch logs/evals. 0 disables.",
+    )
+    ap.add_argument(
+        "--mid_eval_batches",
+        type=int,
+        default=4,
+        help="How many validation batches to use for each mid-epoch mini-eval.",
+    )
     ap.add_argument("--wandb", action="store_true", help="Enable W&B logging.")
     ap.add_argument("--wandb_project", type=str, default="dinov3-pcam-compress")
     ap.add_argument("--wandb_entity", type=str, default=None)
@@ -123,6 +135,7 @@ def main():
     ap.add_argument(
         "--wandb_mode", type=str, default=None, choices=[None, "online", "offline"]
     )
+    ap.add_argument("--method", type=str, default=None)
     ap.add_argument("--data_dir", type=str, default="src/data/pcam")
     ap.add_argument("--resolution", type=int, default=224)
     ap.add_argument("--batch_size", type=int, default=128)
@@ -166,12 +179,12 @@ def main():
             name=run_name,
             config=vars(args),
         )
-        wandb.define_metric("epoch")
-        wandb.define_metric("train/*", step_metric="epoch")
-        wandb.define_metric("val/*", step_metric="epoch")
+        wandb.define_metric("global_step")
+        wandb.define_metric("train/*", step_metric="global_step")
+        wandb.define_metric("val/*", step_metric="global_step")
         wandb.config.update(
             {
-                "method": "linear_probe",
+                "method": args.method,
                 "device": get_device(),
                 "model_id": args.model_id,
             }
@@ -213,6 +226,15 @@ def main():
         num_workers=args.num_workers,
         pin_memory=(device == "cuda"),
     )
+    steps_per_epoch = len(tr)
+    # Respect debug mode if you cap train batches
+    effective_steps = min(steps_per_epoch, args.max_train_batches or steps_per_epoch)
+
+    # Convert fraction → step interval (at least 1 if enabled)
+    log_every_steps = 0
+    if args.eval_frac and args.eval_frac > 0:
+        log_every_steps = max(1, int(round(effective_steps * args.eval_frac)))
+
     va = DataLoader(
         val_ds,
         batch_size=args.val_batch_size,
@@ -247,6 +269,9 @@ def main():
         model.train()
         pbar = tqdm(tr, desc=f"Epoch {epoch}/{args.epochs}")
         running_loss = 0.0
+        global_step = (epoch - 1) * steps_per_epoch  # absolute step across epochs
+        since_log_loss_sum = 0.0
+        since_log_count = 0
         for bi, (x, y) in enumerate(pbar, start=1):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
@@ -255,6 +280,57 @@ def main():
             opt.zero_grad()
             loss.backward()
             opt.step()
+
+            # accumulate loss for this logging window
+            this_loss = loss.item()
+            bs = x.size(0)
+            since_log_loss_sum += this_loss * bs
+            since_log_count += bs
+            global_step += 1
+
+            # run at every fraction of the epoch (and at the end of the effective epoch)
+            hit_boundary = (log_every_steps > 0) and (
+                (bi % log_every_steps) == 0 or bi == effective_steps
+            )
+            if hit_boundary:
+                # 1) log mean train loss over the window
+                mean_window_loss = since_log_loss_sum / max(1, since_log_count)
+
+                # 2) mini validation on a few batches
+                print(f"mini_val: computing, {effective_steps=}")
+                time_start_mini_val = time.time()
+                mini_val = evaluate(
+                    model, va, device, max_batches=args.mid_eval_batches
+                )
+                time_end_mini_val = time.time()
+                print(
+                    f"mini_val: done, took {time_end_mini_val - time_start_mini_val:.1f}s"
+                )
+
+                # 3) W&B log (single step contains both train + val)
+                if args.wandb:
+                    import wandb
+
+                    wandb.log(
+                        {
+                            "global_step": global_step,
+                            "train/loss_window": float(mean_window_loss),
+                            "lr": opt.param_groups[0]["lr"],
+                            "val/AUROC": mini_val["AUROC"],
+                            "val/AUPRC": mini_val["AUPRC"],
+                            "val/NLL": mini_val["NLL"],
+                            "val/Brier": mini_val["Brier"],
+                            "val/ECE": mini_val["ECE"],
+                            "val/Acc@0.5": mini_val["Acc@0.5"],
+                            "val/Sens@95%Spec": mini_val["Sens@95%Spec"],
+                            "val/_scope": "mid_epoch",
+                        }
+                    )
+
+                # 4) reset window accumulators
+                since_log_loss_sum = 0.0
+                since_log_count = 0
+
             running_loss += loss.item() * x.size(0)
             pbar.set_postfix(loss=loss.item())
             if args.max_train_batches and bi >= args.max_train_batches:
@@ -264,6 +340,7 @@ def main():
         # )
 
         # Validation
+        print("Validation: computing")
         val_metrics = evaluate(model, va, device, max_batches=args.max_eval_batches)
         val_auc = val_metrics["AUROC"]
         print(
@@ -275,6 +352,7 @@ def main():
 
             wandb.log(
                 {
+                    "global_step": global_step,  # last step seen this epoch
                     "epoch": epoch,
                     "train/loss_epoch": running_loss / max(1, len(tr.dataset)),  # type:ignore
                     "val/AUROC": val_metrics["AUROC"],
@@ -298,15 +376,20 @@ def main():
             }
 
     # Test
+    print("Test metrics: computing")
     if best_state is not None:
         model.load_state_dict(best_state["model"])
     test_metrics = evaluate(model, te, device, max_batches=args.max_eval_batches)
+    print("Test metrics: done")
 
     # Systems metrics
+    print("Params: computing")
     params = count_params(model)
+    print("Params: done")
     flops = None
     lat_ms, thr = float("nan"), float("nan")
     if not args.skip_bench:
+        print("FLOPs & Latency: computing")
         flops = try_flops(model, img_size=args.resolution, device=device)
         lat_ms, thr = time_latency(
             model,
@@ -316,10 +399,11 @@ def main():
             iters=args.lat_iters,
             max_batches=args.max_eval_batches,
         )
+        print("FLOPs & Latency: done")
 
     # Log row to results.csv
     row = {
-        "method": "linear_probe",
+        "method": args.method,
         "resolution": args.resolution,
         "params": params,
         "flops_g": flops if flops is not None else "",
