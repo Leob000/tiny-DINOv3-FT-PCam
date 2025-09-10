@@ -53,30 +53,30 @@ def get_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def evaluate_loss_streaming(model, loader, it, device, crit, k):
-    """
-    Consume next k batches from (persistent) iterator `it` of `loader`.
-    Returns (avg_loss, updated_iterator).
-    """
-    model.eval()
-    total_loss, total_n = 0.0, 0
-    with torch.no_grad():
-        for _ in range(k):
-            if it is None:
-                it = iter(loader)
-            try:
-                x, y = next(it)
-            except StopIteration:
-                it = iter(loader)
-                x, y = next(it)
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            logits = model(pixel_values=x)
-            loss = crit(logits, y)
-            bs = x.size(0)
-            total_loss += loss.item() * bs
-            total_n += bs
-    return (total_loss / max(1, total_n)), it
+# def evaluate_loss_streaming(model, loader, it, device, crit, k):
+#     """
+#     Consume next k batches from (persistent) iterator `it` of `loader`.
+#     Returns (avg_loss, updated_iterator).
+#     """
+#     model.eval()
+#     total_loss, total_n = 0.0, 0
+#     with torch.no_grad():
+#         for _ in range(k):
+#             if it is None:
+#                 it = iter(loader)
+#             try:
+#                 x, y = next(it)
+#             except StopIteration:
+#                 it = iter(loader)
+#                 x, y = next(it)
+#             x = x.to(device, non_blocking=True)
+#             y = y.to(device, non_blocking=True)
+#             logits = model(pixel_values=x)
+#             loss = crit(logits, y)
+#             bs = x.size(0)
+#             total_loss += loss.item() * bs
+#             total_n += bs
+#     return (total_loss / max(1, total_n)), it
 
 
 def evaluate_loss(model, loader, device, crit, max_batches=0):
@@ -164,18 +164,40 @@ def time_latency(model, loader, device, warmup=20, iters=100, max_batches=0):
 
 
 def main():
+    import wandb
+
     ap = argparse.ArgumentParser()
     ap.add_argument(
-        "--eval_frac",
-        type=float,
-        default=0.25,
-        help="Fraction of an epoch between mid-epoch logs/evals. 0 disables.",
+        "--train_log_every_steps",
+        type=int,
+        default=50,
+        help="Log train loss & LR every X global steps (0 disables).",
     )
     ap.add_argument(
-        "--mid_eval_batches",
-        type=int,
-        default=4,
-        help="How many validation batches to use for each mid-epoch mini-eval.",
+        "--val_eval_frac",
+        type=float,
+        default=0.25,
+        help="Fraction of an epoch between MID-epoch FULL validation evals (0 disables).",
+    )
+    ap.add_argument(
+        "--val_mid_epoch",
+        action="store_true",
+        help="Enable MID-epoch FULL validation (loss-only unless --val_heavy_mid).",
+    )
+    ap.add_argument(
+        "--val_epoch_end",
+        action="store_true",
+        help="Enable END-of-epoch FULL validation (loss-only unless --val_heavy_end).",
+    )
+    ap.add_argument(
+        "--val_heavy_mid",
+        action="store_true",
+        help="At MID-epoch evals, also compute AUROC/AUPRC/ECE/etc.",
+    )
+    ap.add_argument(
+        "--val_heavy_end",
+        action="store_true",
+        help="At END-epoch evals, also compute AUROC/AUPRC/ECE/etc.",
     )
     ap.add_argument("--wandb", action="store_true", help="Enable W&B logging.")
     ap.add_argument("--wandb_project", type=str, default="dinov3-pcam-compress")
@@ -219,7 +241,6 @@ def main():
     if args.wandb:
         if args.wandb_mode:
             os.environ["WANDB_MODE"] = args.wandb_mode
-        import wandb
 
         run_name = args.wandb_run_name or f"linear_probe-res{args.resolution}"
         wandb.init(
@@ -236,6 +257,12 @@ def main():
                 "method": args.method,
                 "device": get_device(),
                 "model_id": args.model_id,
+                "train_log_every_steps": args.train_log_every_steps,
+                "val_eval_frac": args.val_eval_frac,
+                "val_mid_epoch": args.val_mid_epoch,
+                "val_epoch_end": args.val_epoch_end,
+                "val_heavy_mid": args.val_heavy_mid,
+                "val_heavy_end": args.val_heavy_end,
             }
         )
 
@@ -279,22 +306,30 @@ def main():
     # Respect debug mode if you cap train batches
     effective_steps = min(steps_per_epoch, args.max_train_batches or steps_per_epoch)
 
-    # Convert fraction → step interval (at least 1 if enabled)
-    log_every_steps = 0
-    if args.eval_frac and args.eval_frac > 0:
-        log_every_steps = max(1, int(round(effective_steps * args.eval_frac)))
+    # Train logging schedule: every X global steps
+    train_log_every = max(0, int(args.train_log_every_steps))
+
+    # Validation schedule: every fraction of the epoch (mid-epoch)
+    val_every_steps = 0
+    if args.val_mid_epoch and args.val_eval_frac and args.val_eval_frac > 0:
+        val_every_steps = max(1, int(round(effective_steps * args.val_eval_frac)))
+
+    # # Convert fraction → step interval (at least 1 if enabled)
+    # log_every_steps = 0
+    # if args.eval_frac and args.eval_frac > 0:
+    #     log_every_steps = max(1, int(round(effective_steps * args.eval_frac)))
 
     # FAST loaders for mid-epoch loss-only evals (no worker spawn cost)
-    va_fast = DataLoader(
-        val_ds,
-        batch_size=args.val_batch_size,
-        shuffle=False,
-        num_workers=0,  # no worker processes
-        pin_memory=(device == "cuda"),
-    )
-
-    # Keep a persistent iterator across mini-evals
-    va_fast_iter = None
+    # va_fast = DataLoader(
+    #     val_ds,
+    #     batch_size=args.val_batch_size,
+    #     shuffle=False,
+    #     num_workers=0,  # no worker processes
+    #     pin_memory=(device == "cuda"),
+    # )
+    #
+    # # Keep a persistent iterator across mini-evals
+    # va_fast_iter = None
 
     # FULL loaders for heavy metrics at the very end
     va_full = DataLoader(
@@ -336,6 +371,7 @@ def main():
         global_step = (epoch - 1) * steps_per_epoch  # absolute step across epochs
         since_log_loss_sum = 0.0
         since_log_count = 0
+
         for bi, (x, y) in enumerate(pbar, start=1):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
@@ -345,91 +381,108 @@ def main():
             loss.backward()
             opt.step()
 
-            # accumulate loss for the current logging window
-            this_loss = loss.item()
+            # accumulate for train window
             bs = x.size(0)
-            since_log_loss_sum += this_loss * bs
+            since_log_loss_sum += loss.item() * bs
             since_log_count += bs
             global_step += 1
 
-            # run at every fraction of the epoch (and at the end of the effective epoch)
-            hit_boundary = (log_every_steps > 0) and (
-                (bi % log_every_steps) == 0 or bi == effective_steps
-            )
-            if hit_boundary:
-                # 1) mean train loss over the window
+            # (A) TRAIN logging: every X global steps
+            if train_log_every > 0 and (global_step % train_log_every) == 0:
                 mean_window_loss = since_log_loss_sum / max(1, since_log_count)
-
-                # 2) fast mini validation: **loss only**, streaming K batches
-                time_val_eval = time.time()
-                val_loss_window, va_fast_iter = evaluate_loss_streaming(
-                    model, va_fast, va_fast_iter, device, crit, k=args.mid_eval_batches
-                )
-                print(
-                    f"\n[val] loss={val_loss_window:.4f} | time: {time.time() - time_val_eval:.2f}s"
-                )
-
-                # 3) single W&B log step (no heavy metrics here)
                 if args.wandb:
-                    import wandb
-
                     wandb.log(
                         {
                             "global_step": global_step,
                             "train/loss_window": float(mean_window_loss),
-                            "val/loss_window": float(val_loss_window),
                             "lr": opt.param_groups[0]["lr"],
-                            "val/_scope": "mid_epoch",
                         }
                     )
-
-                # 4) reset window accumulators
                 since_log_loss_sum = 0.0
                 since_log_count = 0
 
-            running_loss += loss.item() * x.size(0)
-            pbar.set_postfix(loss=loss.item())
-            if args.max_train_batches and bi >= args.max_train_batches:
-                break
-        # train_loss = running_loss / max(
-        #     1, (args.batch_size * min(len(tr), args.max_train_batches or len(tr)))
-        # )
-
-        # Epoch-end fast validation (loss only)
-        # quick epoch-end check: loss-only on a few batches (or set k to cover all if you like)
-        k_epoch = (
-            args.max_eval_batches
-            if args.max_eval_batches > 0
-            else args.mid_eval_batches
-        )
-        val_loss_epoch, va_fast_iter = evaluate_loss_streaming(
-            model, va_fast, va_fast_iter, device, crit, k=k_epoch
-        )
-        print(f"[val] loss={val_loss_epoch:.4f}")
-
-        if args.wandb:
-            import wandb
-
-            wandb.log(
-                {
-                    "global_step": global_step,  # last step this epoch
-                    "epoch": epoch,
-                    "train/loss_epoch": running_loss
-                    / max(1, len(tr.dataset)),  # rough scalar #type:ignore
-                    "val/loss_epoch": float(val_loss_epoch),
-                    "lr": opt.param_groups[0]["lr"],
-                    "val/_scope": "epoch_end",
+            # (B) MID-epoch FULL validation at fraction boundaries (different schedule)
+            mid_boundary = (
+                args.val_mid_epoch
+                and val_every_steps > 0
+                and (((bi % val_every_steps) == 0) or (bi == effective_steps))
+            )
+            if mid_boundary:
+                # Full val set: loss
+                t0 = time.time()
+                val_loss_mid = evaluate_loss(
+                    model, va_full, device, crit, max_batches=0
+                )
+                log_dict = {
+                    "global_step": global_step,
+                    "val/loss_full": float(val_loss_mid),
+                    "val/_scope": "mid_epoch_full",
                 }
+
+                # Optional heavy metrics on full val
+                if args.val_heavy_mid:
+                    mid_metrics = evaluate(model, va_full, device, max_batches=0)
+                    log_dict.update(
+                        {
+                            "val/AUROC": mid_metrics["AUROC"],
+                            "val/AUPRC": mid_metrics["AUPRC"],
+                            "val/NLL": mid_metrics["NLL"],
+                            "val/Brier": mid_metrics["Brier"],
+                            "val/ECE": mid_metrics["ECE"],
+                            "val/Acc@0.5": mid_metrics["Acc@0.5"],
+                            "val/Sens@95%Spec": mid_metrics["Sens@95%Spec"],
+                        }
+                    )
+                if args.wandb:
+                    wandb.log(log_dict)
+                print(
+                    f"\n[mid-val] full loss={val_loss_mid:.4f} ({time.time() - t0:.2f}s)"
+                )
+        # END-OF-EPOCH validation (optional)
+        val_loss_epoch_end = None
+        if args.val_epoch_end:
+            t0 = time.time()
+            val_loss_epoch_end = evaluate_loss(
+                model, va_full, device, crit, max_batches=0
+            )
+            log_dict = {
+                "global_step": global_step,  # same x-axis
+                "epoch": epoch,
+                "train/loss_epoch": running_loss
+                / max(1, len(tr.dataset)),  # rough scalar #type:ignore
+                "val/loss_full": float(val_loss_epoch_end),
+                "val/_scope": "epoch_end_full",
+                "lr": opt.param_groups[0]["lr"],
+            }
+
+            if args.val_heavy_end:
+                end_metrics = evaluate(model, va_full, device, max_batches=0)
+                log_dict.update(
+                    {
+                        "val/AUROC": end_metrics["AUROC"],
+                        "val/AUPRC": end_metrics["AUPRC"],
+                        "val/NLL": end_metrics["NLL"],
+                        "val/Brier": end_metrics["Brier"],
+                        "val/ECE": end_metrics["ECE"],
+                        "val/Acc@0.5": end_metrics["Acc@0.5"],
+                        "val/Sens@95%Spec": end_metrics["Sens@95%Spec"],
+                    }
+                )
+
+            if args.wandb:
+                wandb.log(log_dict)
+            print(
+                f"[epoch-end val] full loss={val_loss_epoch_end:.4f} ({time.time() - t0:.2f}s)"
             )
 
-        # Track best by val loss
-        if best_state is None or val_loss_epoch < best_state["val_loss_epoch"]:
-            best_state = {
-                "model": model.state_dict(),
-                "epoch": epoch,
-                "val_loss_epoch": float(val_loss_epoch),
-                "args": vars(args),
-            }
+            # Track best by epoch-end full val loss (if enabled)
+            if best_state is None or val_loss_epoch_end < best_state["val_loss_full"]:
+                best_state = {
+                    "model": model.state_dict(),
+                    "epoch": epoch,
+                    "val_loss_full": float(val_loss_epoch_end),
+                    "args": vars(args),
+                }
 
     print("Final evaluation (heavy metrics) on full val & test...")
     if best_state is not None:
@@ -476,8 +529,6 @@ def main():
         "throughput_img_s": thr,
     }
     if args.wandb:
-        import wandb
-
         wandb.log(
             {
                 # final full VAL metrics

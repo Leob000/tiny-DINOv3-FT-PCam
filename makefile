@@ -4,28 +4,11 @@ DATA_DIR=src/data/pcam
 MODEL_ID=facebook/dinov3-vits16-pretrain-lvd1689m
 
 WANDB?=--wandb
-EVAL_FRAC?=0.2
-MID_EVAL_BATCHES?=32
-NUM_WORKERS?=5
+NUM_WORKERS?=4
 EPOCHS?=1
-
-baseline_224:
-	$(PY) -m src.train.train_linear \
-		--data_dir $(DATA_DIR) \
-		--model_id $(MODEL_ID) \
-		--resolution 224 \
-		--batch_size 128 \
-		--val_batch_size 256 \
-		--epochs $(EPOCHS) \
-		--lr 1e-3 \
-		--weight_decay 1e-4 \
-		--num_workers $(NUM_WORKERS) \
-		$(WANDB) --wandb_project dinov3-pcam-compress \
-		--skip_bench \
-		--method linear_probe \
-    --eval_frac $(EVAL_FRAC) \
-    --mid_eval_batches $(MID_EVAL_BATCHES) \
-		--results_csv results.csv
+VAL_EVAL_FRAC?=0.5
+# Possible VAL_FLAGS: val_mid_epoch, val_epoch_end, val_heavy_end, val_heavy_mid
+VAL_FLAGS=--val_mid_epoch --val_epoch_end --val_heavy_end
 
 baseline:
 	$(PY) -m src.train.train_linear \
@@ -41,9 +24,12 @@ baseline:
 		$(WANDB) --wandb_project dinov3-pcam-compress \
 		--skip_bench \
 		--method linear_probe \
-    --eval_frac $(EVAL_FRAC) \
-    --mid_eval_batches $(MID_EVAL_BATCHES) \
+		--train_log_every_steps 2 \
+		--val_eval_frac $(VAL_EVAL_FRAC) \
+		$(VAL_FLAGS) \
 		--results_csv results.csv
+
+# Also possible to have resolution 224
 
 debug:
 	$(PY) -m src.train.train_linear \
