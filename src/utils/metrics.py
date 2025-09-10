@@ -51,8 +51,16 @@ def eval_binary_scores(p, y):
     p = np.asarray(p, dtype=np.float64)
     y = np.asarray(y, dtype=np.int64)
     out = {}
-    out["AUROC"] = float(roc_auc_score(y, p))
-    out["AUPRC"] = float(average_precision_score(y, p))
+
+    # When eval'ing just one batch, y might have a single class → AUROC/AUPRC undefined
+    uniq = np.unique(y)
+    if uniq.size < 2:
+        out["AUROC"] = float("nan")
+        out["AUPRC"] = float("nan")
+    else:
+        out["AUROC"] = float(roc_auc_score(y, p))
+        out["AUPRC"] = float(average_precision_score(y, p))
+
     out["NLL"] = float(log_loss(y, np.c_[1 - p, p], labels=[0, 1]))
     out["Brier"] = float(brier_score_loss(y, p))
     out["ECE"] = ece_binary(p, y)

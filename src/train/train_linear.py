@@ -53,47 +53,50 @@ def get_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, max_batches=0):
     model.eval()
     probs, labels = [], []
     with torch.inference_mode():
-        for x, y in loader:
+        for bi, (x, y) in enumerate(loader, start=1):
             x = x.to(device, non_blocking=True)
             logits = model(pixel_values=x)
             p = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
             probs.append(p)
             labels.append(y.numpy())
-    p = np.concatenate(probs)
-    y = np.concatenate(labels)
+            if max_batches and bi >= max_batches:
+                break
+    p = np.concatenate(probs) if probs else np.array([0.5], dtype=np.float32)
+    y = np.concatenate(labels) if labels else np.array([0], dtype=np.int64)
     return eval_binary_scores(p, y)
 
 
-def time_latency(model, loader, device, warmup=20, iters=100):
+def time_latency(model, loader, device, warmup=20, iters=100, max_batches=0):
     model.eval()
-    it = iter(loader)
-    # warmup
-    for _ in range(warmup):
+
+    def _next(it, loader):
         try:
-            x, _ = next(it)
+            return next(it)
         except StopIteration:
-            it = iter(loader)
-            x, _ = next(it)
+            return next(iter(loader))
+
+    # warmup
+    it = iter(loader)
+    for _ in range(warmup):
+        x, _ = _next(it, loader)
         x = x.to(device)
         _ = model(pixel_values=x)
         if device == "cuda":
             torch.cuda.synchronize()
         if device == "mps":
             torch.mps.synchronize()
+        if max_batches:
+            break
     # timed
     it = iter(loader)
-    nimg = 0
+    nimg, steps = 0, 0
     t0 = time.time()
-    for _ in range(iters):
-        try:
-            x, _ = next(it)
-        except StopIteration:
-            it = iter(loader)
-            x, _ = next(it)
+    while steps < iters:
+        x, _ = _next(it, loader)
         x = x.to(device)
         _ = model(pixel_values=x)
         if device == "cuda":
@@ -101,10 +104,14 @@ def time_latency(model, loader, device, warmup=20, iters=100):
         if device == "mps":
             torch.mps.synchronize()
         nimg += x.size(0)
+        steps += 1
+        if max_batches:
+            break
     dt = time.time() - t0
-    return (
-        dt / nimg
-    ) * 1000.0, nimg / dt  # latency_per_image_ms (ms/img), throughput_img_s (img/s)
+    # avoid div-by-zero
+    if steps == 0 or nimg == 0:
+        return float("nan"), float("nan")
+    return (dt / nimg) * 1000.0, nimg / dt
 
 
 def main():
@@ -122,6 +129,23 @@ def main():
     )
     ap.add_argument("--results_csv", type=str, default="results.csv")
     ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument(
+        "--max_train_batches",
+        type=int,
+        default=0,
+        help="Limit number of train batches per epoch (0=all).",
+    )
+    ap.add_argument(
+        "--max_eval_batches",
+        type=int,
+        default=0,
+        help="Limit number of val/test batches (0=all).",
+    )
+    ap.add_argument(
+        "--skip_bench", action="store_true", help="Skip FLOPs and latency benchmarks."
+    )
+    ap.add_argument("--lat_warmup", type=int, default=20, help="Latency warmup iters.")
+    ap.add_argument("--lat_iters", type=int, default=100, help="Latency timed iters.")
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -194,7 +218,7 @@ def main():
         model.train()
         pbar = tqdm(tr, desc=f"Epoch {epoch}/{args.epochs}")
         running_loss = 0.0
-        for x, y in pbar:
+        for bi, (x, y) in enumerate(pbar, start=1):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
             logits = model(pixel_values=x)
@@ -204,16 +228,20 @@ def main():
             opt.step()
             running_loss += loss.item() * x.size(0)
             pbar.set_postfix(loss=loss.item())
-        # train_loss = running_loss / len(train_ds)
+            if args.max_train_batches and bi >= args.max_train_batches:  # NEW
+                break
+        # train_loss = running_loss / max(
+        #     1, (args.batch_size * min(len(tr), args.max_train_batches or len(tr)))
+        # )
 
         # Validation
-        val_metrics = evaluate(model, va, device)
+        val_metrics = evaluate(model, va, device, max_batches=args.max_eval_batches)
         val_auc = val_metrics["AUROC"]
         print(
             f"[val] AUROC={val_auc:.4f} AUPRC={val_metrics['AUPRC']:.4f} NLL={val_metrics['NLL']:.4f}"
         )
 
-        if val_auc > best_auc:
+        if (not np.isnan(val_auc)) and val_auc > best_auc:
             best_auc = val_auc
             best_state = {
                 "model": model.state_dict(),
@@ -222,15 +250,25 @@ def main():
                 "args": vars(args),
             }
 
-    # Load best & evaluate on test
+    # Test
     if best_state is not None:
         model.load_state_dict(best_state["model"])
-    test_metrics = evaluate(model, te, device)
+    test_metrics = evaluate(model, te, device, max_batches=args.max_eval_batches)
 
     # Systems metrics
     params = count_params(model)
-    flops = try_flops(model, img_size=args.resolution, device=device)  # may return None
-    lat_ms, thr = time_latency(model, te, device=device, warmup=20, iters=100)
+    flops = None
+    lat_ms, thr = float("nan"), float("nan")
+    if not args.skip_bench:
+        flops = try_flops(model, img_size=args.resolution, device=device)
+        lat_ms, thr = time_latency(
+            model,
+            te,
+            device=device,
+            warmup=args.lat_warmup,
+            iters=args.lat_iters,
+            max_batches=args.max_eval_batches,
+        )
 
     # Log row to results.csv
     row = {
