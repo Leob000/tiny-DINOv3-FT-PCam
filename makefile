@@ -4,7 +4,7 @@ DATA_DIR=src/data/pcam
 MODEL_ID=facebook/dinov3-vits16-pretrain-lvd1689m
 
 WANDB?=--wandb
-EVAL_FRAC?=0.05
+EVAL_FRAC?=0.2
 MID_EVAL_BATCHES?=32
 NUM_WORKERS?=5
 EPOCHS?=1

@@ -53,6 +53,55 @@ def get_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def evaluate_loss_streaming(model, loader, it, device, crit, k):
+    """
+    Consume next k batches from (persistent) iterator `it` of `loader`.
+    Returns (avg_loss, updated_iterator).
+    """
+    model.eval()
+    total_loss, total_n = 0.0, 0
+    with torch.no_grad():
+        for _ in range(k):
+            if it is None:
+                it = iter(loader)
+            try:
+                x, y = next(it)
+            except StopIteration:
+                it = iter(loader)
+                x, y = next(it)
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            logits = model(pixel_values=x)
+            loss = crit(logits, y)
+            bs = x.size(0)
+            total_loss += loss.item() * bs
+            total_n += bs
+    return (total_loss / max(1, total_n)), it
+
+
+def evaluate_loss(model, loader, device, crit, max_batches=0):
+    """Fast eval: average cross-entropy loss on GPU. No concatenation/CPU metrics."""
+    model.eval()
+    total_loss, total_n = 0.0, 0
+    with torch.no_grad():
+        for bi, (x, y) in enumerate(loader, start=1):
+            time_batch_start = time.time()
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            logits = model(pixel_values=x)
+            loss = crit(logits, y)
+            bs = x.size(0)
+            total_loss += loss.item() * bs
+            total_n += bs
+            print(
+                f"Eval batch {bi} | time: {time.time() - time_batch_start:.3f}s",
+                end="\r",
+            )
+            if max_batches and bi >= max_batches:
+                break
+    return total_loss / max(1, total_n)
+
+
 def evaluate(model, loader, device, max_batches=0):
     model.eval()
     probs, labels = [], []
@@ -235,18 +284,33 @@ def main():
     if args.eval_frac and args.eval_frac > 0:
         log_every_steps = max(1, int(round(effective_steps * args.eval_frac)))
 
-    va = DataLoader(
+    # FAST loaders for mid-epoch loss-only evals (no worker spawn cost)
+    va_fast = DataLoader(
+        val_ds,
+        batch_size=args.val_batch_size,
+        shuffle=False,
+        num_workers=0,  # no worker processes
+        pin_memory=(device == "cuda"),
+    )
+
+    # Keep a persistent iterator across mini-evals
+    va_fast_iter = None
+
+    # FULL loaders for heavy metrics at the very end
+    va_full = DataLoader(
         val_ds,
         batch_size=args.val_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        persistent_workers=True,  #  keep workers alive across epochs
         pin_memory=(device == "cuda"),
     )
-    te = DataLoader(
+    te_full = DataLoader(
         test_ds,
         batch_size=args.val_batch_size,
         shuffle=False,
         num_workers=args.num_workers,
+        persistent_workers=True,
         pin_memory=(device == "cuda"),
     )
 
@@ -264,7 +328,7 @@ def main():
         model.head.parameters(), lr=args.lr, weight_decay=args.weight_decay
     )
 
-    best_auc, best_state = -1.0, None
+    best_state = None
     for epoch in range(1, args.epochs + 1):
         model.train()
         pbar = tqdm(tr, desc=f"Epoch {epoch}/{args.epochs}")
@@ -277,11 +341,11 @@ def main():
             y = y.to(device, non_blocking=True)
             logits = model(pixel_values=x)
             loss = crit(logits, y)
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
 
-            # accumulate loss for this logging window
+            # accumulate loss for the current logging window
             this_loss = loss.item()
             bs = x.size(0)
             since_log_loss_sum += this_loss * bs
@@ -293,21 +357,19 @@ def main():
                 (bi % log_every_steps) == 0 or bi == effective_steps
             )
             if hit_boundary:
-                # 1) log mean train loss over the window
+                # 1) mean train loss over the window
                 mean_window_loss = since_log_loss_sum / max(1, since_log_count)
 
-                # 2) mini validation on a few batches
-                print(f"mini_val: computing, {effective_steps=}")
-                time_start_mini_val = time.time()
-                mini_val = evaluate(
-                    model, va, device, max_batches=args.mid_eval_batches
+                # 2) fast mini validation: **loss only**, streaming K batches
+                time_val_eval = time.time()
+                val_loss_window, va_fast_iter = evaluate_loss_streaming(
+                    model, va_fast, va_fast_iter, device, crit, k=args.mid_eval_batches
                 )
-                time_end_mini_val = time.time()
                 print(
-                    f"mini_val: done, took {time_end_mini_val - time_start_mini_val:.1f}s"
+                    f"\n[val] loss={val_loss_window:.4f} | time: {time.time() - time_val_eval:.2f}s"
                 )
 
-                # 3) W&B log (single step contains both train + val)
+                # 3) single W&B log step (no heavy metrics here)
                 if args.wandb:
                     import wandb
 
@@ -315,14 +377,8 @@ def main():
                         {
                             "global_step": global_step,
                             "train/loss_window": float(mean_window_loss),
+                            "val/loss_window": float(val_loss_window),
                             "lr": opt.param_groups[0]["lr"],
-                            "val/AUROC": mini_val["AUROC"],
-                            "val/AUPRC": mini_val["AUPRC"],
-                            "val/NLL": mini_val["NLL"],
-                            "val/Brier": mini_val["Brier"],
-                            "val/ECE": mini_val["ECE"],
-                            "val/Acc@0.5": mini_val["Acc@0.5"],
-                            "val/Sens@95%Spec": mini_val["Sens@95%Spec"],
                             "val/_scope": "mid_epoch",
                         }
                     )
@@ -339,48 +395,50 @@ def main():
         #     1, (args.batch_size * min(len(tr), args.max_train_batches or len(tr)))
         # )
 
-        # Validation
-        print("Validation: computing")
-        val_metrics = evaluate(model, va, device, max_batches=args.max_eval_batches)
-        val_auc = val_metrics["AUROC"]
-        print(
-            f"[val] AUROC={val_auc:.4f} AUPRC={val_metrics['AUPRC']:.4f} NLL={val_metrics['NLL']:.4f}"
+        # Epoch-end fast validation (loss only)
+        # quick epoch-end check: loss-only on a few batches (or set k to cover all if you like)
+        k_epoch = (
+            args.max_eval_batches
+            if args.max_eval_batches > 0
+            else args.mid_eval_batches
         )
+        val_loss_epoch, va_fast_iter = evaluate_loss_streaming(
+            model, va_fast, va_fast_iter, device, crit, k=k_epoch
+        )
+        print(f"[val] loss={val_loss_epoch:.4f}")
 
         if args.wandb:
             import wandb
 
             wandb.log(
                 {
-                    "global_step": global_step,  # last step seen this epoch
+                    "global_step": global_step,  # last step this epoch
                     "epoch": epoch,
-                    "train/loss_epoch": running_loss / max(1, len(tr.dataset)),  # type:ignore
-                    "val/AUROC": val_metrics["AUROC"],
-                    "val/AUPRC": val_metrics["AUPRC"],
-                    "val/NLL": val_metrics["NLL"],
-                    "val/Brier": val_metrics["Brier"],
-                    "val/ECE": val_metrics["ECE"],
-                    "val/Acc@0.5": val_metrics["Acc@0.5"],
-                    "val/Sens@95%Spec": val_metrics["Sens@95%Spec"],
+                    "train/loss_epoch": running_loss
+                    / max(1, len(tr.dataset)),  # rough scalar #type:ignore
+                    "val/loss_epoch": float(val_loss_epoch),
                     "lr": opt.param_groups[0]["lr"],
+                    "val/_scope": "epoch_end",
                 }
             )
 
-        if (not np.isnan(val_auc)) and val_auc > best_auc:
-            best_auc = val_auc
+        # Track best by val loss
+        if best_state is None or val_loss_epoch < best_state["val_loss_epoch"]:
             best_state = {
                 "model": model.state_dict(),
                 "epoch": epoch,
-                "val_metrics": val_metrics,
+                "val_loss_epoch": float(val_loss_epoch),
                 "args": vars(args),
             }
 
-    # Test
-    print("Test metrics: computing")
+    print("Final evaluation (heavy metrics) on full val & test...")
     if best_state is not None:
         model.load_state_dict(best_state["model"])
-    test_metrics = evaluate(model, te, device, max_batches=args.max_eval_batches)
-    print("Test metrics: done")
+
+    # Full heavy evals (AUROC/AUPRC/etc.). Use full sets; set max_batches=0 explicitly.
+    val_metrics_full = evaluate(model, va_full, device, max_batches=0)
+    test_metrics_full = evaluate(model, te_full, device, max_batches=0)
+    print("Final evaluation done.")
 
     # Systems metrics
     print("Params: computing")
@@ -393,7 +451,7 @@ def main():
         flops = try_flops(model, img_size=args.resolution, device=device)
         lat_ms, thr = time_latency(
             model,
-            te,
+            te_full,
             device=device,
             warmup=args.lat_warmup,
             iters=args.lat_iters,
@@ -407,43 +465,43 @@ def main():
         "resolution": args.resolution,
         "params": params,
         "flops_g": flops if flops is not None else "",
-        "AUROC": test_metrics["AUROC"],
-        "AUPRC": test_metrics["AUPRC"],
-        "Acc": test_metrics["Acc@0.5"],
-        "NLL": test_metrics["NLL"],
-        "Brier": test_metrics["Brier"],
-        "ECE": test_metrics["ECE"],
-        "Sens@95Spec": test_metrics["Sens@95%Spec"],
+        "AUROC": test_metrics_full["AUROC"],
+        "AUPRC": test_metrics_full["AUPRC"],
+        "Acc": test_metrics_full["Acc@0.5"],
+        "NLL": test_metrics_full["NLL"],
+        "Brier": test_metrics_full["Brier"],
+        "ECE": test_metrics_full["ECE"],
+        "Sens@95Spec": test_metrics_full["Sens@95%Spec"],
         "latency_ms": lat_ms,
         "throughput_img_s": thr,
     }
     if args.wandb:
         import wandb
 
-        # Log test metrics & systems
         wandb.log(
             {
-                "test/AUROC": row["AUROC"],
-                "test/AUPRC": row["AUPRC"],
-                "test/NLL": row["NLL"],
-                "test/Brier": row["Brier"],
-                "test/ECE": row["ECE"],
-                "test/Acc@0.5": row["Acc"],
-                "test/Sens@95%Spec": row["Sens@95Spec"],
-                "system/params": row["params"],
-                "system/FLOPs(G)": row["flops_g"]
-                if row["flops_g"] != ""
-                else float("nan"),
-                "system/latency_ms_per_img": row["latency_ms"],
-                "system/throughput_img_s": row["throughput_img_s"],
-                "resolution": row["resolution"],
+                # final full VAL metrics
+                "final/val/AUROC": val_metrics_full["AUROC"],
+                "final/val/AUPRC": val_metrics_full["AUPRC"],
+                "final/val/NLL": val_metrics_full["NLL"],
+                "final/val/Brier": val_metrics_full["Brier"],
+                "final/val/ECE": val_metrics_full["ECE"],
+                "final/val/Acc@0.5": val_metrics_full["Acc@0.5"],
+                "final/val/Sens@95%Spec": val_metrics_full["Sens@95%Spec"],
+                # final full TEST metrics
+                "test/AUROC": test_metrics_full["AUROC"],
+                "test/AUPRC": test_metrics_full["AUPRC"],
+                "test/NLL": test_metrics_full["NLL"],
+                "test/Brier": test_metrics_full["Brier"],
+                "test/ECE": test_metrics_full["ECE"],
+                "test/Acc@0.5": test_metrics_full["Acc@0.5"],
+                "test/Sens@95%Spec": test_metrics_full["Sens@95%Spec"],
             }
         )
-        # Summaries for quick comparison in the UI
-        wandb.run.summary["best_val_AUROC"] = best_auc  # type:ignore
-        wandb.run.summary["params"] = row["params"]  # type:ignore
-        wandb.run.summary["FLOPs(G)"] = (  # type:ignore
-            row["flops_g"] if row["flops_g"] != "" else float("nan")
+        # optional summaries
+        wandb.run.summary["best_epoch"] = best_state["epoch"] if best_state else None  # type: ignore
+        wandb.run.summary["best_val_loss"] = (  # type:ignore
+            best_state["val_loss_epoch"] if best_state else None
         )
 
         # Log results.csv as an artifact so every run bundles the table
@@ -463,8 +521,12 @@ def main():
             w.writeheader()
         w.writerow(row)
 
-    print("\n== Test metrics ==")
-    for k, v in test_metrics.items():
+    print("\n== Final VAL metrics ==")
+    for k, v in val_metrics_full.items():
+        print(f"{k}: {v:.4f}")
+
+    print("\n== Final TEST metrics ==")
+    for k, v in test_metrics_full.items():
         print(f"{k}: {v:.4f}")
     print(f"Params: {params:,}")
     print(f"FLOPs (G): {flops if flops is not None else 'N/A'}")
