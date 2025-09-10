@@ -1,6 +1,7 @@
 .DS_Store
 organization/
 src/data/pcam/
+results.csv
 
 # Python-generated files
 __pycache__/
