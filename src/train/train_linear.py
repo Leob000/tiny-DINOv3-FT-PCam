@@ -116,6 +116,13 @@ def time_latency(model, loader, device, warmup=20, iters=100, max_batches=0):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--wandb", action="store_true", help="Enable W&B logging.")
+    ap.add_argument("--wandb_project", type=str, default="dinov3-pcam-compress")
+    ap.add_argument("--wandb_entity", type=str, default=None)
+    ap.add_argument("--wandb_run_name", type=str, default=None)
+    ap.add_argument(
+        "--wandb_mode", type=str, default=None, choices=[None, "online", "offline"]
+    )
     ap.add_argument("--data_dir", type=str, default="src/data/pcam")
     ap.add_argument("--resolution", type=int, default=224)
     ap.add_argument("--batch_size", type=int, default=128)
@@ -147,6 +154,28 @@ def main():
     ap.add_argument("--lat_warmup", type=int, default=20, help="Latency warmup iters.")
     ap.add_argument("--lat_iters", type=int, default=100, help="Latency timed iters.")
     args = ap.parse_args()
+    if args.wandb:
+        if args.wandb_mode:
+            os.environ["WANDB_MODE"] = args.wandb_mode
+        import wandb
+
+        run_name = args.wandb_run_name or f"linear_probe-res{args.resolution}"
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            config=vars(args),
+        )
+        wandb.define_metric("epoch")
+        wandb.define_metric("train/*", step_metric="epoch")
+        wandb.define_metric("val/*", step_metric="epoch")
+        wandb.config.update(
+            {
+                "method": "linear_probe",
+                "device": get_device(),
+                "model_id": args.model_id,
+            }
+        )
 
     set_seed(args.seed)
     device = get_device()
@@ -228,7 +257,7 @@ def main():
             opt.step()
             running_loss += loss.item() * x.size(0)
             pbar.set_postfix(loss=loss.item())
-            if args.max_train_batches and bi >= args.max_train_batches:  # NEW
+            if args.max_train_batches and bi >= args.max_train_batches:
                 break
         # train_loss = running_loss / max(
         #     1, (args.batch_size * min(len(tr), args.max_train_batches or len(tr)))
@@ -240,6 +269,24 @@ def main():
         print(
             f"[val] AUROC={val_auc:.4f} AUPRC={val_metrics['AUPRC']:.4f} NLL={val_metrics['NLL']:.4f}"
         )
+
+        if args.wandb:
+            import wandb
+
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "train/loss_epoch": running_loss / max(1, len(tr.dataset)),  # type:ignore
+                    "val/AUROC": val_metrics["AUROC"],
+                    "val/AUPRC": val_metrics["AUPRC"],
+                    "val/NLL": val_metrics["NLL"],
+                    "val/Brier": val_metrics["Brier"],
+                    "val/ECE": val_metrics["ECE"],
+                    "val/Acc@0.5": val_metrics["Acc@0.5"],
+                    "val/Sens@95%Spec": val_metrics["Sens@95%Spec"],
+                    "lr": opt.param_groups[0]["lr"],
+                }
+            )
 
         if (not np.isnan(val_auc)) and val_auc > best_auc:
             best_auc = val_auc
@@ -286,6 +333,44 @@ def main():
         "latency_ms": lat_ms,
         "throughput_img_s": thr,
     }
+    if args.wandb:
+        import wandb
+
+        # Log test metrics & systems
+        wandb.log(
+            {
+                "test/AUROC": row["AUROC"],
+                "test/AUPRC": row["AUPRC"],
+                "test/NLL": row["NLL"],
+                "test/Brier": row["Brier"],
+                "test/ECE": row["ECE"],
+                "test/Acc@0.5": row["Acc"],
+                "test/Sens@95%Spec": row["Sens@95Spec"],
+                "system/params": row["params"],
+                "system/FLOPs(G)": row["flops_g"]
+                if row["flops_g"] != ""
+                else float("nan"),
+                "system/latency_ms_per_img": row["latency_ms"],
+                "system/throughput_img_s": row["throughput_img_s"],
+                "resolution": row["resolution"],
+            }
+        )
+        # Summaries for quick comparison in the UI
+        wandb.run.summary["best_val_AUROC"] = best_auc  # type:ignore
+        wandb.run.summary["params"] = row["params"]  # type:ignore
+        wandb.run.summary["FLOPs(G)"] = (  # type:ignore
+            row["flops_g"] if row["flops_g"] != "" else float("nan")
+        )
+
+        # Log results.csv as an artifact so every run bundles the table
+        try:
+            art = wandb.Artifact("results_table", type="results")
+            art.add_file(args.results_csv)
+            wandb.run.log_artifact(art)  # type:ignore
+        except Exception:
+            pass
+
+        wandb.finish()
     header = list(row.keys())
     exists = os.path.exists(args.results_csv)
     with open(args.results_csv, "a", newline="") as f:

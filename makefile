@@ -3,10 +3,11 @@ PY=python
 DATA_DIR=src/data/pcam
 MODEL_ID=facebook/dinov3-vits16-pretrain-lvd1689m
 
+WANDB?=--wandb
 NUM_WORKERS?=5
-EPOCHS?=2
+EPOCHS?=1
 
-baseline:
+baseline_224:
 	$(PY) -m src.train.train_linear \
 		--data_dir $(DATA_DIR) \
 		--model_id $(MODEL_ID) \
@@ -17,9 +18,10 @@ baseline:
 		--lr 1e-3 \
 		--weight_decay 1e-4 \
 		--num_workers $(NUM_WORKERS) \
+		$(WANDB) --wandb_project dinov3-pcam-compress \
 		--results_csv results.csv
 
-baseline_96:
+baseline:
 	$(PY) -m src.train.train_linear \
 		--data_dir $(DATA_DIR) \
 		--model_id $(MODEL_ID) \
@@ -30,6 +32,7 @@ baseline_96:
 		--lr 1e-3 \
 		--weight_decay 1e-4 \
 		--num_workers $(NUM_WORKERS) \
+		$(WANDB) --wandb_project dinov3-pcam-compress \
 		--results_csv results.csv
 
 debug:

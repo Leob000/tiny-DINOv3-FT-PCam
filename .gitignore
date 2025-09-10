@@ -2,6 +2,7 @@
 organization/
 src/data/pcam/
 results.csv
+wandb/
 
 # Python-generated files
 __pycache__/
