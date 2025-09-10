@@ -49,3 +49,20 @@ class PCamH5HF(Dataset):
                 self.fy.close()
         except Exception:
             pass
+
+    def __getstate__(self):
+        """
+        Make dataset picklable for multi-worker DataLoader:
+        drop non-picklable h5py.File handles so each worker
+        lazily opens its own files after unpickling.
+        """
+        state = self.__dict__.copy()
+        state["fx"] = None
+        state["fy"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # ensure handles are closed / None in the worker until first __getitem__
+        self.fx = None
+        self.fy = None
