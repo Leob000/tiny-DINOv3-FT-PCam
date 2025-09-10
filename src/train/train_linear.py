@@ -53,32 +53,6 @@ def get_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# def evaluate_loss_streaming(model, loader, it, device, crit, k):
-#     """
-#     Consume next k batches from (persistent) iterator `it` of `loader`.
-#     Returns (avg_loss, updated_iterator).
-#     """
-#     model.eval()
-#     total_loss, total_n = 0.0, 0
-#     with torch.no_grad():
-#         for _ in range(k):
-#             if it is None:
-#                 it = iter(loader)
-#             try:
-#                 x, y = next(it)
-#             except StopIteration:
-#                 it = iter(loader)
-#                 x, y = next(it)
-#             x = x.to(device, non_blocking=True)
-#             y = y.to(device, non_blocking=True)
-#             logits = model(pixel_values=x)
-#             loss = crit(logits, y)
-#             bs = x.size(0)
-#             total_loss += loss.item() * bs
-#             total_n += bs
-#     return (total_loss / max(1, total_n)), it
-
-
 def evaluate_loss(model, loader, device, crit, max_batches=0):
     """Fast eval: average cross-entropy loss on GPU. No concatenation/CPU metrics."""
     model.eval()
@@ -301,6 +275,7 @@ def main():
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=(device == "cuda"),
+        drop_last=True,
     )
     steps_per_epoch = len(tr)
     # Respect debug mode if you cap train batches
@@ -314,23 +289,6 @@ def main():
     if args.val_mid_epoch and args.val_eval_frac and args.val_eval_frac > 0:
         val_every_steps = max(1, int(round(effective_steps * args.val_eval_frac)))
 
-    # # Convert fraction → step interval (at least 1 if enabled)
-    # log_every_steps = 0
-    # if args.eval_frac and args.eval_frac > 0:
-    #     log_every_steps = max(1, int(round(effective_steps * args.eval_frac)))
-
-    # FAST loaders for mid-epoch loss-only evals (no worker spawn cost)
-    # va_fast = DataLoader(
-    #     val_ds,
-    #     batch_size=args.val_batch_size,
-    #     shuffle=False,
-    #     num_workers=0,  # no worker processes
-    #     pin_memory=(device == "cuda"),
-    # )
-    #
-    # # Keep a persistent iterator across mini-evals
-    # va_fast_iter = None
-
     # FULL loaders for heavy metrics at the very end
     va_full = DataLoader(
         val_ds,
@@ -339,6 +297,7 @@ def main():
         num_workers=args.num_workers,
         persistent_workers=True,  #  keep workers alive across epochs
         pin_memory=(device == "cuda"),
+        drop_last=True,
     )
     te_full = DataLoader(
         test_ds,
@@ -347,6 +306,7 @@ def main():
         num_workers=args.num_workers,
         persistent_workers=True,
         pin_memory=(device == "cuda"),
+        drop_last=True,
     )
 
     # Model: backbone + linear head
