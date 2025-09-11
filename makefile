@@ -24,7 +24,7 @@ baseline:
 		$(WANDB) --wandb_project dinov3-pcam-compress \
 		--skip_bench \
 		--method linear_probe \
-		--train_log_every_steps 2 \
+		--train_log_every_steps 4 \
 		--val_eval_frac $(VAL_EVAL_FRAC) \
 		$(VAL_FLAGS) \
 		--results_csv results.csv
@@ -41,7 +41,6 @@ serious_baseline:
 		--weight_decay 1e-4 \
 		--num_workers $(NUM_WORKERS) \
 		$(WANDB) --wandb_project dinov3-pcam-compress \
-		--skip_bench \
 		--method linear_probe \
 		--train_log_every_steps 2 \
 		--val_eval_frac $(VAL_EVAL_FRAC) \

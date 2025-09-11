@@ -509,11 +509,17 @@ def main():
                 "test/Sens@95%Spec": test_metrics_full["Sens@95%Spec"],
             }
         )
-        # optional summaries
-        wandb.run.summary["best_epoch"] = best_state["epoch"] if best_state else None  # type: ignore
-        wandb.run.summary["best_val_loss"] = (  # type:ignore
-            best_state["val_loss_epoch"] if best_state else None
-        )
+
+        best_val_loss = None
+        best_epoch = None
+        if best_state is not None:
+            best_val_loss = best_state.get(
+                "val_loss_full", best_state.get("val_loss_epoch")
+            )
+            best_epoch = best_state.get("epoch")
+
+        wandb.run.summary["best_epoch"] = best_epoch  # type:ignore
+        wandb.run.summary["best_val_loss"] = best_val_loss  # type:ignore
 
         # Log results.csv as an artifact so every run bundles the table
         try:
