@@ -471,6 +471,25 @@ def main():
             max_batches=args.max_eval_batches,
         )
         print("FLOPs & Latency: done")
+        if args.wandb:
+            # also log to the timeline (with the final global_step for nice x-axis)
+            wandb.log(
+                {
+                    "global_step": global_step,
+                    "systems/flops_g": (flops if flops is not None else None),
+                    "systems/latency_ms": lat_ms,
+                    "systems/throughput_img_s": thr,
+                }
+            )
+            # and store in run summary
+            assert wandb.run is not None
+            wandb.run.summary.update(
+                {
+                    "systems/flops_g": (flops if flops is not None else None),
+                    "systems/latency_ms": lat_ms,
+                    "systems/throughput_img_s": thr,
+                }
+            )
 
     # Log row to results.csv
     row = {
