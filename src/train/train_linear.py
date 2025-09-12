@@ -265,7 +265,7 @@ def main():
         if args.wandb_mode:
             os.environ["WANDB_MODE"] = args.wandb_mode
 
-        run_name = args.wandb_run_name or f"linear_probe-res{args.resolution}"
+        run_name = args.wandb_run_name or f"{args.method}-res{args.resolution}"
         wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity,
@@ -482,6 +482,7 @@ def main():
         model.train()
         pbar = tqdm(tr, desc=f"Epoch {epoch}/{args.epochs}")
         running_loss = 0.0
+        train_samples_seen = 0
         global_step = (epoch - 1) * steps_per_epoch  # absolute step across epochs
         since_log_loss_sum = 0.0
         since_log_count = 0
@@ -499,6 +500,8 @@ def main():
             bs = x.size(0)
             since_log_loss_sum += loss.item() * bs
             since_log_count += bs
+            running_loss += loss.item() * bs
+            train_samples_seen += bs
             global_step += 1
 
             # (A) TRAIN logging: every X global steps
@@ -525,6 +528,7 @@ def main():
             if mid_boundary:
                 # Full val set: loss
                 t0 = time.time()
+                was_training = model.training
                 val_loss_mid = evaluate_loss(
                     model, va_full, device, crit, max_batches=0
                 )
@@ -553,18 +557,23 @@ def main():
                 print(
                     f"\n[mid-val] full loss={val_loss_mid:.4f} ({time.time() - t0:.2f}s)"
                 )
+                model.train(was_training)
+
+            if args.max_train_batches and bi >= args.max_train_batches:
+                break
+
         # END-OF-EPOCH validation (optional)
         val_loss_epoch_end = None
         if args.val_epoch_end:
             t0 = time.time()
+            was_training = model.training
             val_loss_epoch_end = evaluate_loss(
                 model, va_full, device, crit, max_batches=0
             )
             log_dict = {
                 "global_step": global_step,  # same x-axis
                 "epoch": epoch,
-                "train/loss_epoch": running_loss
-                / max(1, len(tr.dataset)),  # rough scalar #type:ignore
+                "train/loss_epoch": (running_loss / max(1, train_samples_seen)),
                 "val/loss_full": float(val_loss_epoch_end),
                 "val/_scope": "epoch_end_full",
             }
@@ -582,12 +591,15 @@ def main():
                         "val/Sens@95%Spec": end_metrics["Sens@95%Spec"],
                     }
                 )
-
+            log_dict.update(
+                build_lr_log(opt, prefix="epoch_end", global_step=global_step)
+            )
             if args.wandb:
                 wandb.log(log_dict)
             print(
                 f"[epoch-end val] full loss={val_loss_epoch_end:.4f} ({time.time() - t0:.2f}s)"
             )
+            model.train(was_training)
 
             # Track best by epoch-end full val loss (if enabled)
             if best_state is None or val_loss_epoch_end < best_state["val_loss_full"]:
@@ -608,9 +620,6 @@ def main():
     print("Final evaluation done.")
 
     # Systems metrics
-    print("Params: computing")
-    params = count_params(model)
-    print("Params: done")
     flops = None
     lat_ms, thr = float("nan"), float("nan")
     if not args.skip_bench:
@@ -649,7 +658,7 @@ def main():
     row = {
         "method": args.method,
         "resolution": args.resolution,
-        "params": params,
+        "params": params_total,
         "flops_g": flops if flops is not None else "",
         "AUROC": test_metrics_full["AUROC"],
         "AUPRC": test_metrics_full["AUPRC"],
@@ -718,7 +727,7 @@ def main():
     print("\n== Final TEST metrics ==")
     for k, v in test_metrics_full.items():
         print(f"{k}: {v:.4f}")
-    print(f"Params: {params:,}")
+    print(f"Params_total: {params_total:,}")
     print(f"FLOPs (G): {flops if flops is not None else 'N/A'}")
     print(f"Latency (ms/img): {lat_ms:.2f} | Throughput (img/s): {thr:.2f}")
 
