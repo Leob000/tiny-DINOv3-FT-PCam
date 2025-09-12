@@ -1,5 +1,4 @@
 import argparse
-import csv
 import os
 import time
 
@@ -236,7 +235,6 @@ def main():
     ap.add_argument(
         "--model_id", type=str, default="facebook/dinov3-vits16-pretrain-lvd1689m"
     )
-    ap.add_argument("--results_csv", type=str, default="results.csv")
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument(
         "--max_train_batches",
@@ -654,22 +652,6 @@ def main():
                 }
             )
 
-    # Log row to results.csv
-    row = {
-        "method": args.method,
-        "resolution": args.resolution,
-        "params": params_total,
-        "flops_g": flops if flops is not None else "",
-        "AUROC": test_metrics_full["AUROC"],
-        "AUPRC": test_metrics_full["AUPRC"],
-        "Acc": test_metrics_full["Acc@0.5"],
-        "NLL": test_metrics_full["NLL"],
-        "Brier": test_metrics_full["Brier"],
-        "ECE": test_metrics_full["ECE"],
-        "Sens@95Spec": test_metrics_full["Sens@95%Spec"],
-        "latency_ms": lat_ms,
-        "throughput_img_s": thr,
-    }
     if args.wandb:
         wandb.log(
             {
@@ -699,26 +681,9 @@ def main():
                 "val_loss_full", best_state.get("val_loss_epoch")
             )
             best_epoch = best_state.get("epoch")
-
-        wandb.run.summary["best_epoch"] = best_epoch  # type:ignore
-        wandb.run.summary["best_val_loss"] = best_val_loss  # type:ignore
-
-        # Log results.csv as an artifact so every run bundles the table
-        try:
-            art = wandb.Artifact("results_table", type="results")
-            art.add_file(args.results_csv)
-            wandb.run.log_artifact(art)  # type:ignore
-        except Exception:
-            pass
-
+        wandb.run.summary["best_epoch"] = best_epoch  # type: ignore
+        wandb.run.summary["best_val_loss"] = best_val_loss  # type: ignore
         wandb.finish()
-    header = list(row.keys())
-    exists = os.path.exists(args.results_csv)
-    with open(args.results_csv, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=header)
-        if not exists:
-            w.writeheader()
-        w.writerow(row)
 
     print("\n== Final VAL metrics ==")
     for k, v in val_metrics_full.items():

@@ -28,7 +28,6 @@ baseline:
 		--train_log_every_steps 4 \
 		--val_eval_frac $(VAL_EVAL_FRAC) \
 		$(VAL_FLAGS) \
-		--results_csv results.csv
 
 serious_baseline:
 	$(PY) -m src.train.train_linear \
@@ -46,7 +45,6 @@ serious_baseline:
 		--train_log_every_steps 2 \
 		--val_eval_frac $(VAL_EVAL_FRAC) \
 		$(VAL_FLAGS_HUGE) \
-		--results_csv results.csv
 
 lora:
 	$(PY) -m src.train.train_linear \
@@ -66,7 +64,6 @@ lora:
 		--lr_head 1e-3 --lr_lora 1e-3 \
 		--train_log_every_steps 2 \
 		$(VAL_FLAGS) \
-		--results_csv results.csv
 
 
 debug:
@@ -85,4 +82,3 @@ debug:
 		$(WANDB) --wandb_project dinov3-pcam-compress \
 		--skip_bench \
 		--method debug \
-		--results_csv results.csv
