@@ -254,6 +254,7 @@ def main():
     ap.add_argument("--lat_warmup", type=int, default=20, help="Latency warmup iters.")
     ap.add_argument("--lat_iters", type=int, default=100, help="Latency timed iters.")
     args = ap.parse_args()
+    EVAL_K = max(0, int(args.max_eval_batches))
 
     args.lr_head = args.lr if args.lr_head is None else args.lr_head
     args.lr_backbone = args.lr if args.lr_backbone is None else args.lr_backbone
@@ -528,7 +529,7 @@ def main():
                 t0 = time.time()
                 was_training = model.training
                 val_loss_mid = evaluate_loss(
-                    model, va_full, device, crit, max_batches=0
+                    model, va_full, device, crit, max_batches=EVAL_K
                 )
                 log_dict = {
                     "global_step": global_step,
@@ -538,7 +539,7 @@ def main():
 
                 # Optional heavy metrics on full val
                 if args.val_heavy_mid:
-                    mid_metrics = evaluate(model, va_full, device, max_batches=0)
+                    mid_metrics = evaluate(model, va_full, device, max_batches=EVAL_K)
                     log_dict.update(
                         {
                             "val/AUROC": mid_metrics["AUROC"],
@@ -566,7 +567,7 @@ def main():
             t0 = time.time()
             was_training = model.training
             val_loss_epoch_end = evaluate_loss(
-                model, va_full, device, crit, max_batches=0
+                model, va_full, device, crit, max_batches=EVAL_K
             )
             log_dict = {
                 "global_step": global_step,  # same x-axis
@@ -577,7 +578,7 @@ def main():
             }
 
             if args.val_heavy_end:
-                end_metrics = evaluate(model, va_full, device, max_batches=0)
+                end_metrics = evaluate(model, va_full, device, max_batches=EVAL_K)
                 log_dict.update(
                     {
                         "val/AUROC": end_metrics["AUROC"],
@@ -613,8 +614,8 @@ def main():
         model.load_state_dict(best_state["model"])
 
     # Full heavy evals (AUROC/AUPRC/etc.). Use full sets; set max_batches=0 explicitly.
-    val_metrics_full = evaluate(model, va_full, device, max_batches=0)
-    test_metrics_full = evaluate(model, te_full, device, max_batches=0)
+    val_metrics_full = evaluate(model, va_full, device, max_batches=EVAL_K)
+    test_metrics_full = evaluate(model, te_full, device, max_batches=EVAL_K)
     print("Final evaluation done.")
 
     # Systems metrics
@@ -629,7 +630,7 @@ def main():
             device=device,
             warmup=args.lat_warmup,
             iters=args.lat_iters,
-            max_batches=args.max_eval_batches,
+            max_batches=EVAL_K,
         )
         print("FLOPs & Latency: done")
         if args.wandb:

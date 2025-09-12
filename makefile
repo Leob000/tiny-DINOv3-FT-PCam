@@ -79,6 +79,5 @@ debug:
 		--num_workers $(NUM_WORKERS) \
 		--max_train_batches 1 \
 		--max_eval_batches 1 \
-		$(WANDB) --wandb_project dinov3-pcam-compress \
 		--skip_bench \
 		--method linear_probe \
