@@ -9,8 +9,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.data.pcam_hf import PCamH5HF
-from src.models.backbone_dinov3 import DinoV3Backbone
-from src.models.classifier import DinoV3PCam
+from src.models.backbone_dinov3 import DinoV3Backbone, DinoV3PCam
 from src.models.lora import inject_lora
 from src.utils.metrics import eval_binary_scores
 from src.utils.seed import set_seed

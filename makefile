@@ -68,6 +68,7 @@ lora:
 
 debug:
 	$(PY) -m src.train.train_linear \
+		--method linear_probe \
 		--data_dir $(DATA_DIR) \
 		--model_id $(MODEL_ID) \
 		--resolution 96 \
@@ -80,4 +81,3 @@ debug:
 		--max_train_batches 1 \
 		--max_eval_batches 1 \
 		--skip_bench \
-		--method linear_probe \
