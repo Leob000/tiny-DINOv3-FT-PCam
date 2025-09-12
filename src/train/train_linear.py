@@ -417,6 +417,7 @@ def main():
             alpha=args.lora_alpha,
             dropout=args.lora_dropout,
         )
+        model.to(device)
 
         # train LoRA params + head
         param_groups.append(

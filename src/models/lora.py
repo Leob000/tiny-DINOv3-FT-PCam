@@ -25,10 +25,18 @@ class LoRALinear(nn.Module):
         self.scale = (self.alpha / self.r) if self.r > 0 else 0.0
         self.drop = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
 
+        # match device & dtype of the frozen base weight
+        dev = self.base.weight.device
+        dt = self.base.weight.dtype
+
         if self.r > 0:
             # A: [r, in], B: [out, r]
-            self.A = nn.Parameter(torch.zeros(self.r, self.base.in_features))
-            self.B = nn.Parameter(torch.zeros(self.base.out_features, self.r))
+            self.A = nn.Parameter(
+                torch.zeros(self.r, self.base.in_features, device=dev, dtype=dt)
+            )
+            self.B = nn.Parameter(
+                torch.zeros(self.base.out_features, self.r, device=dev, dtype=dt)
+            )
             # init per LoRA paper: A ~ N(0, 0.02), B zero
             nn.init.normal_(self.A, std=0.02)
             nn.init.zeros_(self.B)

@@ -68,7 +68,7 @@ lora:
 
 debug:
 	$(PY) -m src.train.train_linear \
-		--method linear_probe \
+		--method fullft \
 		--data_dir $(DATA_DIR) \
 		--model_id $(MODEL_ID) \
 		--resolution 96 \
