@@ -12,6 +12,7 @@ from tqdm import tqdm
 from src.data.pcam_hf import PCamH5HF
 from src.models.backbone_dinov3 import DinoV3Backbone
 from src.models.classifier import DinoV3PCam
+from src.models.lora import inject_lora
 from src.utils.metrics import eval_binary_scores
 from src.utils.seed import set_seed
 
@@ -137,10 +138,54 @@ def time_latency(model, loader, device, warmup=20, iters=100, max_batches=0):
     return (dt / nimg) * 1000.0, nimg / dt
 
 
+def build_lr_log(opt, prefix: str, global_step: int):
+    log = {"global_step": global_step}
+    for i, g in enumerate(opt.param_groups):
+        tag = g.get("name", f"group{i}")
+        log[f"{prefix}/lr_{tag}"] = g["lr"]
+    return log
+
+
 def main():
     import wandb
 
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--method",
+        type=str,
+        default="linear_probe",
+        choices=["linear_probe", "fullft", "lora"],
+        help="Training method: freeze backbone (linear_probe), full finetune, or LoRA.",
+    )
+    ap.add_argument(
+        "--lr_head", type=float, default=None, help="Overrides LR for cls head."
+    )
+    ap.add_argument(
+        "--lr_backbone",
+        type=float,
+        default=None,
+        help="Overrides LR for backbone (fullft).",
+    )
+    ap.add_argument(
+        "--lr_lora", type=float, default=None, help="Overrides LR for LoRA params."
+    )
+
+    # LoRA hyperparams
+    ap.add_argument("--lora_r", type=int, default=8)
+    ap.add_argument("--lora_alpha", type=int, default=16)
+    ap.add_argument("--lora_dropout", type=float, default=0.0)
+    ap.add_argument(
+        "--lora_targets",
+        type=str,
+        default="q_proj,k_proj,v_proj,o_proj",
+        help="Comma-separated substrings of Linear module names to wrap with LoRA.",
+    )
+    ap.add_argument(
+        "--lora_include_mlp",
+        action="store_true",
+        help="Also apply LoRA to MLP 'up_proj,down_proj'.",
+    )
+
     ap.add_argument(
         "--train_log_every_steps",
         type=int,
@@ -180,7 +225,6 @@ def main():
     ap.add_argument(
         "--wandb_mode", type=str, default=None, choices=[None, "online", "offline"]
     )
-    ap.add_argument("--method", type=str, default=None)
     ap.add_argument("--data_dir", type=str, default="src/data/pcam")
     ap.add_argument("--resolution", type=int, default=224)
     ap.add_argument("--batch_size", type=int, default=128)
@@ -212,6 +256,11 @@ def main():
     ap.add_argument("--lat_warmup", type=int, default=20, help="Latency warmup iters.")
     ap.add_argument("--lat_iters", type=int, default=100, help="Latency timed iters.")
     args = ap.parse_args()
+
+    args.lr_head = args.lr if args.lr_head is None else args.lr_head
+    args.lr_backbone = args.lr if args.lr_backbone is None else args.lr_backbone
+    args.lr_lora = args.lr if args.lr_lora is None else args.lr_lora
+
     if args.wandb:
         if args.wandb_mode:
             os.environ["WANDB_MODE"] = args.wandb_mode
@@ -237,6 +286,14 @@ def main():
                 "val_epoch_end": args.val_epoch_end,
                 "val_heavy_mid": args.val_heavy_mid,
                 "val_heavy_end": args.val_heavy_end,
+                "lr_head": args.lr_head,
+                "lr_backbone": args.lr_backbone,
+                "lr_lora": args.lr_lora,
+                "lora_r": args.lora_r,
+                "lora_alpha": args.lora_alpha,
+                "lora_dropout": args.lora_dropout,
+                "lora_targets": args.lora_targets,
+                "lora_include_mlp": args.lora_include_mlp,
             }
         )
 
@@ -297,7 +354,7 @@ def main():
         num_workers=args.num_workers,
         persistent_workers=True,  #  keep workers alive across epochs
         pin_memory=(device == "cuda"),
-        drop_last=True,
+        drop_last=False,
     )
     te_full = DataLoader(
         test_ds,
@@ -306,7 +363,7 @@ def main():
         num_workers=args.num_workers,
         persistent_workers=True,
         pin_memory=(device == "cuda"),
-        drop_last=True,
+        drop_last=False,
     )
 
     # Model: backbone + linear head
@@ -314,15 +371,112 @@ def main():
     backbone = DinoV3Backbone(model_id=args.model_id, dtype=torch.float32)
     model = DinoV3PCam(backbone).to(device)
 
-    # Freeze backbone (linear probe)
-    for p in model.backbone.parameters():
-        p.requires_grad = False
+    # Decide what to train
+    param_groups = []
+    trainable_names = []
+
+    lora_param_count = 0
+    if args.method == "linear_probe":
+        # freeze backbone
+        for p in model.backbone.parameters():
+            p.requires_grad = False
+        param_groups.append(
+            {"params": model.head.parameters(), "lr": args.lr_head, "name": "head"}
+        )
+        trainable_names.append("head")
+
+    elif args.method == "fullft":
+        # train everything; optionally give head its own LR
+        for p in model.parameters():
+            p.requires_grad = True
+        # two groups so head can learn faster if desired
+        head_params = list(model.head.parameters())
+        bb_params = [
+            p for n, p in model.named_parameters() if not n.startswith("head.")
+        ]
+        param_groups.append(
+            {"params": bb_params, "lr": args.lr_backbone, "name": "backbone"}
+        )
+        param_groups.append({"params": head_params, "lr": args.lr_head, "name": "head"})
+        trainable_names.extend(["backbone", "head"])
+
+    elif args.method == "lora":
+        # freeze backbone weights
+        for p in model.backbone.parameters():
+            p.requires_grad = False
+
+        # choose targets
+        target_keys = [s.strip() for s in args.lora_targets.split(",") if s.strip()]
+        if args.lora_include_mlp:
+            target_keys += ["up_proj", "down_proj"]
+
+        # inject LoRA into the HF DINOv3 module inside the wrapper
+        dino_core = model.backbone.model
+        lora_params = inject_lora(
+            dino_core,
+            target_keys=target_keys,
+            r=args.lora_r,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+        )
+
+        # train LoRA params + head
+        param_groups.append(
+            {
+                "params": lora_params,
+                "lr": args.lr_lora,
+                "weight_decay": 0.0,
+                "name": "lora",
+            }
+        )
+        param_groups.append(
+            {"params": model.head.parameters(), "lr": args.lr_head, "name": "head"}
+        )
+        trainable_names.extend(["lora", "head"])
+
+        lora_param_count = sum(p.numel() for p in lora_params)
+    else:
+        raise ValueError(f"Unknown method: {args.method}")
+
+    # --- Systems stats: params total + trainable (grouped here near param selection)
+    params_total = count_params(model)
+
+    def count_trainable(m: nn.Module) -> int:
+        return sum(p.numel() for p in m.parameters() if p.requires_grad)
+
+    trainable_count = count_trainable(model)
+
+    print(
+        f"Params (total): {params_total:,} | "
+        f"Trainable: {trainable_count:,} ({'+'.join(trainable_names)})"
+    )
+    global_step = 0
+    if args.wandb:
+        # Put them in both the timeline (step 0) and the run summary
+        wandb.log(
+            {
+                "global_step": global_step,
+                "systems/params_total": params_total,
+                "systems/params_trainable_count": trainable_count,
+                "systems/params_trainable_groups": trainable_names,
+                **(
+                    {"systems/params_lora": lora_param_count}
+                    if lora_param_count
+                    else {}
+                ),
+            }
+        )
+        assert wandb.run is not None
+        wandb.run.summary["systems/params_total"] = params_total
+        wandb.run.summary["systems/params_trainable_count"] = trainable_count
+        wandb.run.summary["systems/params_trainable_groups"] = trainable_names
+        if lora_param_count:
+            wandb.run.summary["systems/params_lora"] = lora_param_count
+
+    # build optimizer with param groups
+    opt = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
 
     crit = nn.CrossEntropyLoss()
-    opt = torch.optim.AdamW(
-        model.head.parameters(), lr=args.lr, weight_decay=args.weight_decay
-    )
-
     best_state = None
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -351,13 +505,14 @@ def main():
             if train_log_every > 0 and (global_step % train_log_every) == 0:
                 mean_window_loss = since_log_loss_sum / max(1, since_log_count)
                 if args.wandb:
-                    wandb.log(
-                        {
-                            "global_step": global_step,
-                            "train/loss_window": float(mean_window_loss),
-                            "lr": opt.param_groups[0]["lr"],
-                        }
+                    log = {
+                        "global_step": global_step,
+                        "train/loss_window": float(mean_window_loss),
+                    }
+                    log.update(
+                        build_lr_log(opt, prefix="train", global_step=global_step)
                     )
+                    wandb.log(log)
                 since_log_loss_sum = 0.0
                 since_log_count = 0
 
@@ -412,7 +567,6 @@ def main():
                 / max(1, len(tr.dataset)),  # rough scalar #type:ignore
                 "val/loss_full": float(val_loss_epoch_end),
                 "val/_scope": "epoch_end_full",
-                "lr": opt.param_groups[0]["lr"],
             }
 
             if args.val_heavy_end:

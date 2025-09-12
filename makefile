@@ -9,6 +9,7 @@ VAL_EVAL_FRAC?=0.5
 # Possible VAL_FLAGS: val_mid_epoch, val_epoch_end, val_heavy_end, val_heavy_mid
 VAL_FLAGS=--val_mid_epoch --val_epoch_end --val_heavy_end
 VAL_FLAGS_HUGE=--val_mid_epoch --val_epoch_end --val_heavy_end --val_heavy_mid
+# Also possible to have resolution 224
 
 baseline:
 	$(PY) -m src.train.train_linear \
@@ -47,7 +48,26 @@ serious_baseline:
 		$(VAL_FLAGS_HUGE) \
 		--results_csv results.csv
 
-# Also possible to have resolution 224
+lora:
+	$(PY) -m src.train.train_linear \
+		--data_dir $(DATA_DIR) \
+		--model_id $(MODEL_ID) \
+		--resolution 96 \
+		--batch_size 256 \
+		--val_batch_size 512 \
+		--epochs $(EPOCHS) \
+		--num_workers $(NUM_WORKERS) \
+		$(WANDB) --wandb_project dinov3-pcam-compress \
+		--skip_bench \
+		--method lora\
+		--lora_r 8 --lora_alpha 16 --lora_dropout 0.05 \
+		--lora_targets q_proj,k_proj,v_proj,o_proj \
+		--lora_include_mlp \
+		--lr_head 1e-3 --lr_lora 1e-3 \
+		--train_log_every_steps 2 \
+		$(VAL_FLAGS) \
+		--results_csv results.csv
+
 
 debug:
 	$(PY) -m src.train.train_linear \
