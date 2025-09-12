@@ -81,4 +81,4 @@ debug:
 		--max_eval_batches 1 \
 		$(WANDB) --wandb_project dinov3-pcam-compress \
 		--skip_bench \
-		--method debug \
+		--method linear_probe \
