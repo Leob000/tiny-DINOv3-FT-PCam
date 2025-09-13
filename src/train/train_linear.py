@@ -1,4 +1,5 @@
 import argparse
+import math
 import os
 import time
 from typing import Dict
@@ -143,6 +144,28 @@ def build_lr_log(opt, prefix: str, global_step: int):
         tag = g.get("name", f"group{i}")
         log[f"{prefix}/lr_{tag}"] = g["lr"]
     return log
+
+
+def build_cosine_with_warmup(optimizer, warmup_steps: int, total_steps: int):
+    """
+    Linear warmup to step `warmup_steps`, then cosine decay to step `total_steps`.
+    Works per-step (call scheduler.step() once after each optimizer.step()).
+    """
+    warmup_steps = max(0, int(warmup_steps))
+    total_steps = max(1, int(total_steps))
+    # ensure we have at least one non-warmup step
+    warmup_steps = min(warmup_steps, total_steps - 1)
+
+    def lr_lambda(step: int):
+        if step < warmup_steps:
+            return float(step) / float(max(1, warmup_steps))
+        # cosine phase
+        progress = float(step - warmup_steps) / float(
+            max(1, total_steps - warmup_steps)
+        )
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def enable_and_collect_norms_bias(
@@ -365,6 +388,18 @@ def main():
         default=None,
         help="LR for norms/bias param group. Defaults to lr_head (head_only) or lr_lora (LoRA).",
     )
+    ap.add_argument(
+        "--warmup_steps", type=int, default=200, help="Linear warmup steps."
+    )
+    ap.add_argument(
+        "--grad_clip", type=float, default=1.0, help="Grad clip max-norm; 0 disables."
+    )
+    ap.add_argument(
+        "--label_smoothing",
+        type=float,
+        default=0.0,
+        help="CrossEntropy label smoothing.",
+    )
     args = ap.parse_args()
     EVAL_K = max(0, int(args.max_eval_batches))
 
@@ -481,7 +516,6 @@ def main():
     )
 
     # Model: backbone + linear head
-
     backbone = DinoV3Backbone(model_id=args.model_id, dtype=torch.float32)
     model = DinoV3PCam(backbone).to(device)
 
@@ -626,7 +660,11 @@ def main():
     # build optimizer with param groups
     opt = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
 
-    crit = nn.CrossEntropyLoss()
+    # Per-step scheduler: linear warmup then cosine decay across the whole run
+    total_steps = max(1, args.epochs * max(1, effective_steps))
+    scheduler = build_cosine_with_warmup(opt, args.warmup_steps, total_steps)
+
+    crit = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     best_state = None
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -644,7 +682,10 @@ def main():
             loss = crit(logits, y)
             opt.zero_grad(set_to_none=True)
             loss.backward()
+            if args.grad_clip and args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
+            scheduler.step()
 
             # accumulate for train window
             bs = x.size(0)

@@ -13,6 +13,9 @@ WANDB?=--wandb
 NUM_WORKERS?=4
 EPOCHS?=16
 RESOLUTION?=96
+WARMUP_STEPS?=200
+GRAD_CLIP?=1.0
+LABEL_SMOOTHING?=0.0
 BATCH_SIZE?=256
 VAL_BATCH_SIZE?=512
 LR?=1.0e-3
@@ -51,6 +54,8 @@ baseline:
 		--lora_include_mlp \
 		--lr_head $(LR_HEAD) --lr_lora $(LR_LORA) \
 		--train_norms_bias $(TRAIN_NORMS_BIAS) \
+		--warmup_steps $(WARMUP_STEPS) --grad_clip $(GRAD_CLIP) \
+		--label_smoothing $(LABEL_SMOOTHING) \
 		--save_best
 
 debug:
@@ -68,7 +73,8 @@ debug:
 		--max_train_batches 1 \
 		--max_eval_batches 1 \
 		--skip_bench \
-		--save_last
+		--warmup_steps 0 --grad_clip $(GRAD_CLIP) \
+		--label_smoothing $(LABEL_SMOOTHING) \
 
 SLURM_PARTITION ?= tau
 SLURM_TIME ?= 24:00:00
@@ -105,6 +111,8 @@ COMMON = $(PY) -m src.train.train_linear \
   --lora_include_mlp \
   --lr_head $(LR_HEAD) --lr_lora $(LR_LORA) \
   --train_norms_bias $(TRAIN_NORMS_BIAS) \
+		--warmup_steps $(WARMUP_STEPS) --grad_clip $(GRAD_CLIP) \
+		--label_smoothing $(LABEL_SMOOTHING) \
   --save_best
 
 .PHONY: common
