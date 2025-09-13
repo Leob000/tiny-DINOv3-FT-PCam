@@ -1,8 +1,8 @@
 # local: `make model METHOD=head_only` (default METHOD=head_only, other: lora, fullft)
-# GPU cluster: `make smodel METHOD=head_only` (default METHOD=head_only, other: lora, fullft)
+# Slurm GPU cluster: `make smodel METHOD=head_only` (default METHOD=head_only, other: lora, fullft)
 PY=python
 DATA_DIR=src/data/pcam
-MODEL_ID=facebook/dinov3-vits16-pretrain-lvd1689m
+MODEL_ID=facebook/dinov3-vits16-pretrain-lvd1689m # Backbone model
 
 # Download PCam, run once before other commands
 get-data:
@@ -11,11 +11,11 @@ get-data:
 METHOD?=head_only
 WANDB?=--wandb
 NUM_WORKERS?=4
-EPOCHS?=16
+EPOCHS?=4
 RESOLUTION?=96
 WARMUP_STEPS?=200
 GRAD_CLIP?=1.0
-LABEL_SMOOTHING?=0.0
+LABEL_SMOOTHING?=0.05
 BATCH_SIZE?=256
 VAL_BATCH_SIZE?=512
 LR?=1.0e-3
@@ -30,7 +30,8 @@ VAL_EVAL_FRAC?=0.5
 # Possible VAL_FLAGS: val_mid_epoch, val_epoch_end, val_heavy_end, val_heavy_mid
 VAL_FLAGS=--val_mid_epoch --val_epoch_end --val_heavy_end
 VAL_FLAGS_HUGE=--val_mid_epoch --val_epoch_end --val_heavy_end --val_heavy_mid
-TRAIN_NORMS_BIAS=none # [none, norms, bias, both] train the LayerNorms params for head_only/LoRA methods
+TRAIN_NORMS_BIAS?=none # [none, norms, bias, both] train the LayerNorms params for head_only/LoRA methods
+LR_NORMS_BIAS?=5.0e-4
 
 baseline:
 	$(PY) -m src.train.train_linear \
@@ -53,7 +54,7 @@ baseline:
 		--lora_targets $(LORA_TARGETS) \
 		--lora_include_mlp \
 		--lr_head $(LR_HEAD) --lr_lora $(LR_LORA) \
-		--train_norms_bias $(TRAIN_NORMS_BIAS) \
+		--train_norms_bias $(TRAIN_NORMS_BIAS) --lr_norms_bias $(LR_NORMS_BIAS) \
 		--warmup_steps $(WARMUP_STEPS) --grad_clip $(GRAD_CLIP) \
 		--label_smoothing $(LABEL_SMOOTHING) \
 		--save_best
@@ -110,9 +111,9 @@ COMMON = $(PY) -m src.train.train_linear \
   --lora_targets $(LORA_TARGETS) \
   --lora_include_mlp \
   --lr_head $(LR_HEAD) --lr_lora $(LR_LORA) \
-  --train_norms_bias $(TRAIN_NORMS_BIAS) \
-		--warmup_steps $(WARMUP_STEPS) --grad_clip $(GRAD_CLIP) \
-		--label_smoothing $(LABEL_SMOOTHING) \
+	--train_norms_bias $(TRAIN_NORMS_BIAS) --lr_norms_bias $(LR_NORMS_BIAS) \
+	--warmup_steps $(WARMUP_STEPS) --grad_clip $(GRAD_CLIP) \
+	--label_smoothing $(LABEL_SMOOTHING) \
   --save_best
 
 .PHONY: common
