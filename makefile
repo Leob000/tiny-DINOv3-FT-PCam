@@ -13,6 +13,16 @@ WANDB?=--wandb
 NUM_WORKERS?=4
 EPOCHS?=16
 RESOLUTION?=96
+BATCH_SIZE?=256
+VAL_BATCH_SIZE?=512
+LR?=1.0e-3
+WEIGHT_DECAY?=1.0e-4
+LORA_R?=8
+LORA_ALPHA?=16
+LORA_DROPOUT?=0.05
+LORA_TARGETS?=q_proj,k_proj,v_proj,o_proj
+LR_HEAD?=1.0e-3
+LR_LORA?=1.0e-3
 VAL_EVAL_FRAC?=0.5
 # Possible VAL_FLAGS: val_mid_epoch, val_epoch_end, val_heavy_end, val_heavy_mid
 VAL_FLAGS=--val_mid_epoch --val_epoch_end --val_heavy_end
@@ -24,11 +34,11 @@ baseline:
 		--data_dir $(DATA_DIR) \
 		--model_id $(MODEL_ID) \
 		--resolution $(RESOLUTION) \
-		--batch_size 256 \
-		--val_batch_size 512 \
+		--batch_size $(BATCH_SIZE) \
+		--val_batch_size $(VAL_BATCH_SIZE) \
 		--epochs $(EPOCHS) \
-		--lr 1e-3 \
-		--weight_decay 1e-4 \
+		--lr $(LR) \
+		--weight_decay $(WEIGHT_DECAY) \
 		--num_workers $(NUM_WORKERS) \
 		$(WANDB) --wandb_project dinov3-pcam-compress \
 		--skip_bench \
@@ -36,10 +46,10 @@ baseline:
 		--train_log_every_steps 4 \
 		--val_eval_frac $(VAL_EVAL_FRAC) \
 		$(VAL_FLAGS) \
-		--lora_r 8 --lora_alpha 16 --lora_dropout 0.05 \
-		--lora_targets q_proj,k_proj,v_proj,o_proj \
+		--lora_r $(LORA_R) --lora_alpha $(LORA_ALPHA) --lora_dropout $(LORA_DROPOUT) \
+		--lora_targets $(LORA_TARGETS) \
 		--lora_include_mlp \
-		--lr_head 1e-3 --lr_lora 1e-3 \
+		--lr_head $(LR_HEAD) --lr_lora $(LR_LORA) \
 		--train_norms_bias $(TRAIN_NORMS_BIAS) \
 		--save_best
 
@@ -83,17 +93,17 @@ COMMON = $(PY) -m src.train.train_linear \
 	--method $(METHOD) \
   --resolution $(RESOLUTION) \
   --num_workers $(NUM_WORKERS) \
-  --batch_size 256 --val_batch_size 512 \
-  --epochs $(EPOCHS) --lr 1e-3 --weight_decay 1e-4 \
+  --batch_size $(BATCH_SIZE) --val_batch_size $(VAL_BATCH_SIZE) \
+  --epochs $(EPOCHS) --lr $(LR) --weight_decay $(WEIGHT_DECAY) \
   $(WANDB) --wandb_project dinov3-pcam-compress \
   --skip_bench \
   --train_log_every_steps 4 \
   --val_eval_frac $(VAL_EVAL_FRAC) \
   $(VAL_FLAGS_HUGE) \
-  --lora_r 8 --lora_alpha 16 --lora_dropout 0.05 \
-  --lora_targets q_proj,k_proj,v_proj,o_proj \
+  --lora_r $(LORA_R) --lora_alpha $(LORA_ALPHA) --lora_dropout $(LORA_DROPOUT) \
+  --lora_targets $(LORA_TARGETS) \
   --lora_include_mlp \
-  --lr_head 1e-3 --lr_lora 1e-3 \
+  --lr_head $(LR_HEAD) --lr_lora $(LR_LORA) \
   --train_norms_bias $(TRAIN_NORMS_BIAS) \
   --save_best
 
