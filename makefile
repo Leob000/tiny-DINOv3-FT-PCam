@@ -24,7 +24,7 @@ baseline:
 		--num_workers $(NUM_WORKERS) \
 		$(WANDB) --wandb_project dinov3-pcam-compress \
 		--skip_bench \
-		--method linear_probe \
+		--method head_only \
 		--train_log_every_steps 4 \
 		--val_eval_frac $(VAL_EVAL_FRAC) \
 		$(VAL_FLAGS) \
@@ -41,7 +41,7 @@ serious_baseline:
 		--weight_decay 1e-4 \
 		--num_workers $(NUM_WORKERS) \
 		$(WANDB) --wandb_project dinov3-pcam-compress \
-		--method linear_probe \
+		--method head_only \
 		--train_log_every_steps 2 \
 		--val_eval_frac $(VAL_EVAL_FRAC) \
 		$(VAL_FLAGS_HUGE) \
@@ -68,7 +68,7 @@ lora:
 
 debug:
 	$(PY) -m src.train.train_linear \
-		--method fullft \
+		--method head_only \
 		--data_dir $(DATA_DIR) \
 		--model_id $(MODEL_ID) \
 		--resolution 96 \

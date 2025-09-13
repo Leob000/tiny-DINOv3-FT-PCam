@@ -151,9 +151,9 @@ def main():
     ap.add_argument(
         "--method",
         type=str,
-        default="linear_probe",
-        choices=["linear_probe", "fullft", "lora"],
-        help="Training method: freeze backbone (linear_probe), full finetune, or LoRA.",
+        default="head_only",
+        choices=["head_only", "fullft", "lora"],
+        help="Training method: freeze backbone (head_only), full finetune, or LoRA.",
     )
     ap.add_argument(
         "--lr_head", type=float, default=None, help="Overrides LR for cls head."
@@ -263,7 +263,9 @@ def main():
         if args.wandb_mode:
             os.environ["WANDB_MODE"] = args.wandb_mode
 
-        run_name = args.wandb_run_name or f"{args.method}-res{args.resolution}"
+        run_name = (
+            args.wandb_run_name or f"{args.method}-{time.strftime('%Y%m%d-%H%M%S')}"
+        )
         wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity,
@@ -333,7 +335,7 @@ def main():
         drop_last=True,
     )
     steps_per_epoch = len(tr)
-    # Respect debug mode if you cap train batches
+    # Respect debug mode if train batches capped
     effective_steps = min(steps_per_epoch, args.max_train_batches or steps_per_epoch)
 
     # Train logging schedule: every X global steps
@@ -372,9 +374,8 @@ def main():
     # Decide what to train
     param_groups = []
     trainable_names = []
-
     lora_param_count = 0
-    if args.method == "linear_probe":
+    if args.method == "head_only":
         # freeze backbone
         for p in model.backbone.parameters():
             p.requires_grad = False
@@ -408,7 +409,7 @@ def main():
         if args.lora_include_mlp:
             target_keys += ["up_proj", "down_proj"]
 
-        # inject LoRA into the HF DINOv3 module inside the wrapper
+        # inject LoRA into the DINOv3 module inside the wrapper
         dino_core = model.backbone.model
         lora_params = inject_lora(
             dino_core,
@@ -437,7 +438,7 @@ def main():
     else:
         raise ValueError(f"Unknown method: {args.method}")
 
-    # --- Systems stats: params total + trainable (grouped here near param selection)
+    # Systems stats: params total + trainable (grouped here near param selection)
     params_total = count_params(model)
 
     def count_trainable(m: nn.Module) -> int:
@@ -503,7 +504,7 @@ def main():
             train_samples_seen += bs
             global_step += 1
 
-            # (A) TRAIN logging: every X global steps
+            # Train logging: every X global steps
             if train_log_every > 0 and (global_step % train_log_every) == 0:
                 mean_window_loss = since_log_loss_sum / max(1, since_log_count)
                 if args.wandb:
@@ -518,7 +519,7 @@ def main():
                 since_log_loss_sum = 0.0
                 since_log_count = 0
 
-            # (B) MID-epoch FULL validation at fraction boundaries (different schedule)
+            # MID-epoch FULL validation at fraction boundaries (different schedule)
             mid_boundary = (
                 args.val_mid_epoch
                 and val_every_steps > 0
@@ -561,7 +562,7 @@ def main():
             if args.max_train_batches and bi >= args.max_train_batches:
                 break
 
-        # END-OF-EPOCH validation (optional)
+        # END-OF-EPOCH validation
         val_loss_epoch_end = None
         if args.val_epoch_end:
             t0 = time.time()
