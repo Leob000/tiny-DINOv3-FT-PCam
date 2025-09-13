@@ -1,6 +1,7 @@
 import argparse
 import os
 import time
+from typing import Dict
 
 import numpy as np
 import torch
@@ -10,10 +11,9 @@ from tqdm import tqdm
 
 from src.data.pcam_hf import PCamH5HF
 from src.models.backbone_dinov3 import DinoV3Backbone, DinoV3PCam
-from src.models.lora import inject_lora, LoRALinear
+from src.models.lora import LoRALinear, inject_lora
 from src.utils.metrics import eval_binary_scores
 from src.utils.seed import set_seed
-from typing import Dict
 
 
 # Optional FLOPs (safe fallback if ptflops not installed or fails)
@@ -143,6 +143,37 @@ def build_lr_log(opt, prefix: str, global_step: int):
         tag = g.get("name", f"group{i}")
         log[f"{prefix}/lr_{tag}"] = g["lr"]
     return log
+
+
+def enable_and_collect_norms_bias(
+    backbone_core: nn.Module, mode: str
+) -> list[nn.Parameter]:
+    """
+    backbone_core: the HF DINOv3 module (e.g., model.backbone.model)
+    mode: 'none' | 'norms' | 'bias' | 'both'
+    Returns a de-duplicated list of Parameters that should be optimized.
+    """
+    if mode == "none":
+        return []
+
+    params = []
+
+    if mode in ("norms", "both"):
+        for m in backbone_core.modules():
+            if isinstance(m, nn.LayerNorm):
+                for p in m.parameters(recurse=False):
+                    p.requires_grad = True
+                    params.append(p)
+
+    if mode in ("bias", "both"):
+        for name, p in backbone_core.named_parameters():
+            if name.endswith(".bias"):
+                p.requires_grad = True
+                params.append(p)
+
+    # De-duplicate by id
+    uniq = list({id(p): p for p in params}.values())
+    return uniq
 
 
 def state_dict_cpu(m: nn.Module) -> Dict[str, torch.Tensor]:
@@ -321,6 +352,19 @@ def main():
     ap.add_argument("--save_dir", type=str, default="checkpoints")
     ap.add_argument("--save_last", action="store_true")
     ap.add_argument("--save_best", action="store_true")
+    ap.add_argument(
+        "--train_norms_bias",
+        type=str,
+        default="none",
+        choices=["none", "norms", "bias", "both"],
+        help="If not 'none', also train LayerNorm params ('norms'), biases ('bias'), or both ('both') in the backbone for head_only/LoRA.",
+    )
+    ap.add_argument(
+        "--lr_norms_bias",
+        type=float,
+        default=None,
+        help="LR for norms/bias param group. Defaults to lr_head (head_only) or lr_lora (LoRA).",
+    )
     args = ap.parse_args()
     EVAL_K = max(0, int(args.max_eval_batches))
 
@@ -362,6 +406,8 @@ def main():
                 "lora_dropout": args.lora_dropout,
                 "lora_targets": args.lora_targets,
                 "lora_include_mlp": args.lora_include_mlp,
+                "train_norms_bias": args.train_norms_bias,
+                "lr_norms_bias": args.lr_norms_bias,
             }
         )
 
@@ -451,6 +497,23 @@ def main():
             {"params": model.head.parameters(), "lr": args.lr_head, "name": "head"}
         )
         trainable_names.append("head")
+        # Optionally train LayerNorms/bias in the backbone too
+        nb_params = enable_and_collect_norms_bias(
+            model.backbone.model, args.train_norms_bias
+        )
+        if nb_params:
+            lr_nb = (
+                args.lr_norms_bias if args.lr_norms_bias is not None else args.lr_head
+            )
+            param_groups.append(
+                {
+                    "params": nb_params,
+                    "lr": lr_nb,
+                    "weight_decay": 0.0,
+                    "name": "norms_bias",
+                }
+            )
+            trainable_names.append("norms_bias")
 
     elif args.method == "fullft":
         # train everything; optionally give head its own LR
@@ -487,6 +550,25 @@ def main():
             dropout=args.lora_dropout,
         )
         model.to(device)
+
+        # Optionally train LayerNorms/bias in the backbone along with LoRA
+        nb_params = enable_and_collect_norms_bias(
+            model.backbone.model, args.train_norms_bias
+        )
+        if nb_params:
+            # If unset, follow LoRA LR by default
+            lr_nb = (
+                args.lr_norms_bias if args.lr_norms_bias is not None else args.lr_lora
+            )
+            param_groups.append(
+                {
+                    "params": nb_params,
+                    "lr": lr_nb,
+                    "weight_decay": 0.0,
+                    "name": "norms_bias",
+                }
+            )
+            trainable_names.append("norms_bias")
 
         # train LoRA params + head
         param_groups.append(

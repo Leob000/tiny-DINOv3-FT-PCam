@@ -17,7 +17,7 @@ VAL_EVAL_FRAC?=0.5
 # Possible VAL_FLAGS: val_mid_epoch, val_epoch_end, val_heavy_end, val_heavy_mid
 VAL_FLAGS=--val_mid_epoch --val_epoch_end --val_heavy_end
 VAL_FLAGS_HUGE=--val_mid_epoch --val_epoch_end --val_heavy_end --val_heavy_mid
-# Also possible to have resolution 224
+TRAIN_NORMS_BIAS=none # [none, norms, bias, both] train the LayerNorms params for head_only/LoRA methods
 
 baseline:
 	$(PY) -m src.train.train_linear \
@@ -40,6 +40,7 @@ baseline:
 		--lora_targets q_proj,k_proj,v_proj,o_proj \
 		--lora_include_mlp \
 		--lr_head 1e-3 --lr_lora 1e-3 \
+		--train_norms_bias $(TRAIN_NORMS_BIAS) \
 		--save_best
 
 debug:
@@ -93,6 +94,7 @@ COMMON = $(PY) -m src.train.train_linear \
   --lora_targets q_proj,k_proj,v_proj,o_proj \
   --lora_include_mlp \
   --lr_head 1e-3 --lr_lora 1e-3 \
+  --train_norms_bias $(TRAIN_NORMS_BIAS) \
   --save_best
 
 .PHONY: common
