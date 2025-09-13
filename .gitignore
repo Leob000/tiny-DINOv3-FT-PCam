@@ -3,6 +3,7 @@ organization/
 src/data/pcam/
 results.csv
 wandb/
+checkpoints/
 
 # Python-generated files
 __pycache__/

@@ -28,6 +28,7 @@ baseline:
 		--train_log_every_steps 4 \
 		--val_eval_frac $(VAL_EVAL_FRAC) \
 		$(VAL_FLAGS) \
+		--save_best \
 
 serious_baseline:
 	$(PY) -m src.train.train_linear \
@@ -45,6 +46,7 @@ serious_baseline:
 		--train_log_every_steps 2 \
 		--val_eval_frac $(VAL_EVAL_FRAC) \
 		$(VAL_FLAGS_HUGE) \
+		--save_best \
 
 lora:
 	$(PY) -m src.train.train_linear \
@@ -64,6 +66,7 @@ lora:
 		--lr_head 1e-3 --lr_lora 1e-3 \
 		--train_log_every_steps 2 \
 		$(VAL_FLAGS) \
+		--save_best \
 
 
 debug:
@@ -81,3 +84,4 @@ debug:
 		--max_train_batches 1 \
 		--max_eval_batches 1 \
 		--skip_bench \
+		--save_last \

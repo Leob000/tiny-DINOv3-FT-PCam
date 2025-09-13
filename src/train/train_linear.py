@@ -10,9 +10,10 @@ from tqdm import tqdm
 
 from src.data.pcam_hf import PCamH5HF
 from src.models.backbone_dinov3 import DinoV3Backbone, DinoV3PCam
-from src.models.lora import inject_lora
+from src.models.lora import inject_lora, LoRALinear
 from src.utils.metrics import eval_binary_scores
 from src.utils.seed import set_seed
+from typing import Dict
 
 
 # Optional FLOPs (safe fallback if ptflops not installed or fails)
@@ -144,6 +145,32 @@ def build_lr_log(opt, prefix: str, global_step: int):
     return log
 
 
+def state_dict_cpu(m: nn.Module) -> Dict[str, torch.Tensor]:
+    # safe for MPS/CUDA: store on CPU
+    return {k: v.detach().to("cpu") for k, v in m.state_dict().items()}
+
+
+def lora_adapter_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """Collect only LoRA A/B tensors from LoRALinear modules, by qualified name."""
+    out: Dict[str, torch.Tensor] = {}
+    for name, mod in model.named_modules():
+        if isinstance(mod, LoRALinear) and mod.r > 0:
+            out[f"{name}.A"] = mod.A.detach().cpu()
+            out[f"{name}.B"] = mod.B.detach().cpu()
+    return out
+
+
+def save_checkpoint_full(path: str, model: nn.Module, args, extra=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {
+        "type": "full",
+        "state_dict": state_dict_cpu(model),
+        "args": vars(args),
+        "extra": extra or {},
+    }
+    torch.save(payload, path)
+
+
 def main():
     import wandb
 
@@ -219,7 +246,6 @@ def main():
     ap.add_argument("--wandb", action="store_true", help="Enable W&B logging.")
     ap.add_argument("--wandb_project", type=str, default="dinov3-pcam-compress")
     ap.add_argument("--wandb_entity", type=str, default=None)
-    ap.add_argument("--wandb_run_name", type=str, default=None)
     ap.add_argument(
         "--wandb_mode", type=str, default=None, choices=[None, "online", "offline"]
     )
@@ -252,6 +278,9 @@ def main():
     )
     ap.add_argument("--lat_warmup", type=int, default=20, help="Latency warmup iters.")
     ap.add_argument("--lat_iters", type=int, default=100, help="Latency timed iters.")
+    ap.add_argument("--save_dir", type=str, default="checkpoints")
+    ap.add_argument("--save_last", action="store_true")
+    ap.add_argument("--save_best", action="store_true")
     args = ap.parse_args()
     EVAL_K = max(0, int(args.max_eval_batches))
 
@@ -259,13 +288,12 @@ def main():
     args.lr_backbone = args.lr if args.lr_backbone is None else args.lr_backbone
     args.lr_lora = args.lr if args.lr_lora is None else args.lr_lora
 
+    run_name = f"{time.strftime('%Y%m%d-%H%M%S')}-{args.method}"
+    run_dir = os.path.join(args.save_dir, run_name)
     if args.wandb:
         if args.wandb_mode:
             os.environ["WANDB_MODE"] = args.wandb_mode
 
-        run_name = (
-            args.wandb_run_name or f"{args.method}-{time.strftime('%Y%m%d-%H%M%S')}"
-        )
         wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity,
@@ -604,15 +632,24 @@ def main():
             # Track best by epoch-end full val loss (if enabled)
             if best_state is None or val_loss_epoch_end < best_state["val_loss_full"]:
                 best_state = {
-                    "model": model.state_dict(),
+                    "state_dict": state_dict_cpu(model),
                     "epoch": epoch,
                     "val_loss_full": float(val_loss_epoch_end),
-                    "args": vars(args),
                 }
+                if args.save_best:
+                    save_checkpoint_full(
+                        os.path.join(run_dir, "best_full.pt"),
+                        model,
+                        args,
+                        extra={
+                            "val_loss_full": float(val_loss_epoch_end),
+                            "epoch": epoch,
+                        },
+                    )
 
     print("Final evaluation (heavy metrics) on full val & test...")
     if best_state is not None:
-        model.load_state_dict(best_state["model"])
+        model.load_state_dict(best_state["state_dict"], strict=True)
 
     # Full heavy evals (AUROC/AUPRC/etc.). Use full sets; set max_batches=0 explicitly.
     val_metrics_full = evaluate(model, va_full, device, max_batches=EVAL_K)
@@ -694,9 +731,21 @@ def main():
     print("\n== Final TEST metrics ==")
     for k, v in test_metrics_full.items():
         print(f"{k}: {v:.4f}")
-    print(f"Params_total: {params_total:,}")
     print(f"FLOPs (G): {flops if flops is not None else 'N/A'}")
     print(f"Latency (ms/img): {lat_ms:.2f} | Throughput (img/s): {thr:.2f}")
+
+    # Save last checkpoint if requested
+    if args.save_last:
+        save_checkpoint_full(
+            os.path.join(run_dir, "last_full.pt"),
+            model,
+            args,
+            extra={
+                "final_val": val_metrics_full,
+                "final_test": test_metrics_full,
+                "epoch": args.epochs,
+            },
+        )
 
 
 if __name__ == "__main__":
