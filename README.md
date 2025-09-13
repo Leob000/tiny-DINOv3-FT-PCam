@@ -1,3 +1,9 @@
+## Requirements (format this better later)
+- `uv` package manager, python 3.12+. Sync the packages with `uv sync`.
+- PCam dataset, get the data with `make get-data`.
+- Access to DINOv3 weights (request access from Meta), access with a CLI HuggingFace login.
+- Basic command: `make model`
+
 ## License
 
 - Code: MIT (see `LICENSE`).

@@ -1,5 +1,5 @@
-# local: `make baseline`, `make lora`, ...
-# GPU cluster: `make sbaseline`, `make slora`, ...
+# local: `make model METHOD=head_only` (default METHOD=head_only, other: lora, fullft)
+# GPU cluster: `make smodel METHOD=head_only` (default METHOD=head_only, other: lora, fullft)
 PY=python
 DATA_DIR=src/data/pcam
 MODEL_ID=facebook/dinov3-vits16-pretrain-lvd1689m
@@ -8,9 +8,11 @@ MODEL_ID=facebook/dinov3-vits16-pretrain-lvd1689m
 get-data:
 	$(PY) -m scripts.download_pcam --out $(DATA_DIR)
 
+METHOD?=head_only
 WANDB?=--wandb
 NUM_WORKERS?=4
-EPOCHS?=2
+EPOCHS?=16
+RESOLUTION?=96
 VAL_EVAL_FRAC?=0.5
 # Possible VAL_FLAGS: val_mid_epoch, val_epoch_end, val_heavy_end, val_heavy_mid
 VAL_FLAGS=--val_mid_epoch --val_epoch_end --val_heavy_end
@@ -21,7 +23,7 @@ baseline:
 	$(PY) -m src.train.train_linear \
 		--data_dir $(DATA_DIR) \
 		--model_id $(MODEL_ID) \
-		--resolution 96 \
+		--resolution $(RESOLUTION) \
 		--batch_size 256 \
 		--val_batch_size 512 \
 		--epochs $(EPOCHS) \
@@ -30,54 +32,19 @@ baseline:
 		--num_workers $(NUM_WORKERS) \
 		$(WANDB) --wandb_project dinov3-pcam-compress \
 		--skip_bench \
-		--method head_only \
+		--method $(METHOD) \
 		--train_log_every_steps 4 \
 		--val_eval_frac $(VAL_EVAL_FRAC) \
 		$(VAL_FLAGS) \
-		--save_best
-
-serious_baseline:
-	$(PY) -m src.train.train_linear \
-		--data_dir $(DATA_DIR) \
-		--model_id $(MODEL_ID) \
-		--resolution 96 \
-		--batch_size 256 \
-		--val_batch_size 512 \
-		--epochs 10 \
-		--lr 1e-3 \
-		--weight_decay 1e-4 \
-		--num_workers $(NUM_WORKERS) \
-		$(WANDB) --wandb_project dinov3-pcam-compress \
-		--method head_only \
-		--train_log_every_steps 2 \
-		--val_eval_frac $(VAL_EVAL_FRAC) \
-		$(VAL_FLAGS_HUGE) \
-		--save_best
-
-lora:
-	$(PY) -m src.train.train_linear \
-		--data_dir $(DATA_DIR) \
-		--model_id $(MODEL_ID) \
-		--resolution 96 \
-		--batch_size 256 \
-		--val_batch_size 512 \
-		--epochs $(EPOCHS) \
-		--num_workers $(NUM_WORKERS) \
-		$(WANDB) --wandb_project dinov3-pcam-compress \
-		--skip_bench \
-		--method lora\
 		--lora_r 8 --lora_alpha 16 --lora_dropout 0.05 \
 		--lora_targets q_proj,k_proj,v_proj,o_proj \
 		--lora_include_mlp \
 		--lr_head 1e-3 --lr_lora 1e-3 \
-		--train_log_every_steps 2 \
-		$(VAL_FLAGS) \
 		--save_best
-
 
 debug:
 	$(PY) -m src.train.train_linear \
-		--method head_only \
+		--method $(METHOD) \
 		--data_dir $(DATA_DIR) \
 		--model_id $(MODEL_ID) \
 		--resolution 96 \
@@ -109,11 +76,11 @@ SBATCH = sbatch \
 	--nodes=1 \
 	--ntasks-per-node=1
 
-# Common part of your python command
-COMMON = -m src.train.train_linear \
+COMMON = $(PY) -m src.train.train_linear \
   --data_dir $(DATA_DIR) \
   --model_id $(MODEL_ID) \
-  --resolution 96 \
+	--method $(METHOD) \
+  --resolution $(RESOLUTION) \
   --num_workers $(NUM_WORKERS) \
   --batch_size 256 --val_batch_size 512 \
   --epochs $(EPOCHS) --lr 1e-3 --weight_decay 1e-4 \
@@ -122,19 +89,13 @@ COMMON = -m src.train.train_linear \
   --train_log_every_steps 4 \
   --val_eval_frac $(VAL_EVAL_FRAC) \
   $(VAL_FLAGS_HUGE) \
-  --save_best
-
-BASELINE_CMD = $(PY) $(COMMON) \
-  --method head_only
-
-LORA_CMD = $(PY) $(COMMON) \
-  --method lora \
   --lora_r 8 --lora_alpha 16 --lora_dropout 0.05 \
   --lora_targets q_proj,k_proj,v_proj,o_proj \
   --lora_include_mlp \
-  --lr_head 1e-3 --lr_lora 1e-3
+  --lr_head 1e-3 --lr_lora 1e-3 \
+  --save_best
 
-.PHONY: sbaseline slora
+.PHONY: common
 
 # Where the project & venv live on the cluster
 CLUSTER_DIR ?= $(HOME)/Tiny-DINOv3-PCam
@@ -150,10 +111,6 @@ bash -lc "source /home/tau/lburgund/.bashrc; \
   $(1)"
 endef
 
-sbaseline:
+smodel:
 	mkdir -p slurm
-	$(SBATCH) --wrap='$(call WRAP_CMD,$(BASELINE_CMD))'
-
-slora:
-	mkdir -p slurm
-	$(SBATCH) --wrap='$(call WRAP_CMD,$(LORA_CMD))'
+	$(SBATCH) --wrap='$(call WRAP_CMD,$(COMMON))'
