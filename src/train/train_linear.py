@@ -171,6 +171,46 @@ def save_checkpoint_full(path: str, model: nn.Module, args, extra=None):
     torch.save(payload, path)
 
 
+def save_checkpoint_head(path: str, model: nn.Module, args, extra=None):
+    """
+    Save only classification head weights + minimal metadata.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {
+        "type": "head_only",
+        "head": {k: v.detach().cpu() for k, v in model.head.state_dict().items()},  # type:ignore
+        "backbone_model_id": args.model_id,
+        "image_size": args.resolution,
+        "args": vars(args),
+        "extra": extra or {},
+    }
+    torch.save(payload, path)
+
+
+def save_checkpoint_lora(path: str, model: nn.Module, args, extra=None):
+    """
+    Save only LoRA adapters (A/B) + classification head + minimal metadata.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {
+        "type": "lora",
+        "adapters": lora_adapter_state_dict(model),  # only A/B
+        "head": {k: v.detach().cpu() for k, v in model.head.state_dict().items()},  # type:ignore
+        "backbone_model_id": args.model_id,
+        "image_size": args.resolution,
+        "lora_hparams": {
+            "r": args.lora_r,
+            "alpha": args.lora_alpha,
+            "dropout": args.lora_dropout,
+            "targets": args.lora_targets,
+            "include_mlp": args.lora_include_mlp,
+        },
+        "args": vars(args),
+        "extra": extra or {},
+    }
+    torch.save(payload, path)
+
+
 def main():
     import wandb
 
@@ -632,20 +672,35 @@ def main():
             # Track best by epoch-end full val loss (if enabled)
             if best_state is None or val_loss_epoch_end < best_state["val_loss_full"]:
                 best_state = {
-                    "state_dict": state_dict_cpu(model),
+                    "state_dict": state_dict_cpu(
+                        model
+                    ),  # keep full state for in-run reload
                     "epoch": epoch,
                     "val_loss_full": float(val_loss_epoch_end),
                 }
                 if args.save_best:
-                    save_checkpoint_full(
-                        os.path.join(run_dir, "best_full.pt"),
-                        model,
-                        args,
-                        extra={
-                            "val_loss_full": float(val_loss_epoch_end),
-                            "epoch": epoch,
-                        },
-                    )
+                    extra = {"val_loss_full": float(val_loss_epoch_end), "epoch": epoch}
+                    if args.method == "fullft":
+                        save_checkpoint_full(
+                            os.path.join(run_dir, "best_full.pt"),
+                            model,
+                            args,
+                            extra=extra,
+                        )
+                    elif args.method == "lora":
+                        save_checkpoint_lora(
+                            os.path.join(run_dir, "best_lora.pt"),
+                            model,
+                            args,
+                            extra=extra,
+                        )
+                    elif args.method == "head_only":
+                        save_checkpoint_head(
+                            os.path.join(run_dir, "best_head.pt"),
+                            model,
+                            args,
+                            extra=extra,
+                        )
 
     print("Final evaluation (heavy metrics) on full val & test...")
     if best_state is not None:
@@ -736,16 +791,23 @@ def main():
 
     # Save last checkpoint if requested
     if args.save_last:
-        save_checkpoint_full(
-            os.path.join(run_dir, "last_full.pt"),
-            model,
-            args,
-            extra={
-                "final_val": val_metrics_full,
-                "final_test": test_metrics_full,
-                "epoch": args.epochs,
-            },
-        )
+        extra = {
+            "final_val": val_metrics_full,
+            "final_test": test_metrics_full,
+            "epoch": args.epochs,
+        }
+        if args.method == "fullft":
+            save_checkpoint_full(
+                os.path.join(run_dir, "last_full.pt"), model, args, extra=extra
+            )
+        elif args.method == "lora":
+            save_checkpoint_lora(
+                os.path.join(run_dir, "last_lora.pt"), model, args, extra=extra
+            )
+        elif args.method == "head_only":
+            save_checkpoint_head(
+                os.path.join(run_dir, "last_head.pt"), model, args, extra=extra
+            )
 
 
 if __name__ == "__main__":
