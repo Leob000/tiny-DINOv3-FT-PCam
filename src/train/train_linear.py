@@ -400,6 +400,16 @@ def main():
         default=0.0,
         help="CrossEntropy label smoothing.",
     )
+    ap.add_argument(
+        "--val_epoch0",
+        action="store_true",
+        help="Evaluate on the full validation set before any training (epoch=0).",
+    )
+    ap.add_argument(
+        "--val_heavy_zero",
+        action="store_true",
+        help="At epoch-0 eval, also compute AUROC/AUPRC/ECE/etc.",
+    )
     args = ap.parse_args()
     EVAL_K = max(0, int(args.max_eval_batches))
 
@@ -665,6 +675,36 @@ def main():
     scheduler = build_cosine_with_warmup(opt, args.warmup_steps, total_steps)
 
     crit = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+
+    # epoch0 evaluation
+    if args.val_epoch0:
+        t0 = time.time()
+        was_training = model.training
+        val_loss_zero = evaluate_loss(model, va_full, device, crit, max_batches=EVAL_K)
+        log_dict = {
+            "global_step": 0,  # align with other step-0 logs
+            "epoch": 0,
+            "val/loss_full": float(val_loss_zero),
+            "val/_scope": "epoch0_full",
+        }
+        if args.val_heavy_zero:
+            zero_metrics = evaluate(model, va_full, device, max_batches=EVAL_K)
+            log_dict.update(
+                {
+                    "val/AUROC": zero_metrics["AUROC"],
+                    "val/AUPRC": zero_metrics["AUPRC"],
+                    "val/NLL": zero_metrics["NLL"],
+                    "val/Brier": zero_metrics["Brier"],
+                    "val/ECE": zero_metrics["ECE"],
+                    "val/Acc@0.5": zero_metrics["Acc@0.5"],
+                    "val/Sens@95%Spec": zero_metrics["Sens@95%Spec"],
+                }
+            )
+        if args.wandb:
+            wandb.log(log_dict)
+        print(f"[epoch-0 val] full loss={val_loss_zero:.4f} ({time.time() - t0:.2f}s)")
+        model.train(was_training)
+
     best_state = None
     for epoch in range(1, args.epochs + 1):
         model.train()

@@ -11,7 +11,7 @@ get-data:
 METHOD?=head_only
 WANDB?=--wandb
 NUM_WORKERS?=4
-EPOCHS?=4
+EPOCHS?=8
 RESOLUTION?=96
 WARMUP_STEPS?=200
 GRAD_CLIP?=1.0
@@ -25,13 +25,14 @@ LORA_ALPHA?=16
 LORA_DROPOUT?=0.05
 LORA_TARGETS?=q_proj,k_proj,v_proj,o_proj
 LR_HEAD?=1.0e-3
-LR_LORA?=1.0e-3
+LR_LORA?=5.0e-4
+LR_NORMS_BIAS?=5.0e-4
 VAL_EVAL_FRAC?=0.5
 # Possible VAL_FLAGS: val_mid_epoch, val_epoch_end, val_heavy_end, val_heavy_mid
 VAL_FLAGS=--val_mid_epoch --val_epoch_end --val_heavy_end
 VAL_FLAGS_HUGE=--val_mid_epoch --val_epoch_end --val_heavy_end --val_heavy_mid
+VAL_FLAGS_NO_MID=--val_epoch_end --val_heavy_end
 TRAIN_NORMS_BIAS?=none # [none, norms, bias, both] train the LayerNorms params for head_only/LoRA methods
-LR_NORMS_BIAS?=5.0e-4
 
 baseline:
 	$(PY) -m src.train.train_linear \
@@ -49,7 +50,7 @@ baseline:
 		--method $(METHOD) \
 		--train_log_every_steps 4 \
 		--val_eval_frac $(VAL_EVAL_FRAC) \
-		$(VAL_FLAGS) \
+		$(VAL_FLAGS_NO_MID) \
 		--lora_r $(LORA_R) --lora_alpha $(LORA_ALPHA) --lora_dropout $(LORA_DROPOUT) \
 		--lora_targets $(LORA_TARGETS) \
 		--lora_include_mlp \
@@ -106,7 +107,7 @@ COMMON = $(PY) -m src.train.train_linear \
   --skip_bench \
   --train_log_every_steps 4 \
   --val_eval_frac $(VAL_EVAL_FRAC) \
-  $(VAL_FLAGS_HUGE) \
+  $(VAL_FLAGS_NO_MID) \
   --lora_r $(LORA_R) --lora_alpha $(LORA_ALPHA) --lora_dropout $(LORA_DROPOUT) \
   --lora_targets $(LORA_TARGETS) \
   --lora_include_mlp \
