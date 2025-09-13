@@ -4,6 +4,10 @@ PY=python
 DATA_DIR=src/data/pcam
 MODEL_ID=facebook/dinov3-vits16-pretrain-lvd1689m
 
+# Download PCam, run once before other commands
+get-data:
+	$(PY) -m scripts.download_pcam --out $(DATA_DIR)
+
 WANDB?=--wandb
 NUM_WORKERS?=4
 EPOCHS?=2
