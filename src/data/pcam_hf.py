@@ -13,6 +13,7 @@ class PCamH5HF(Dataset):
         h5_y,
         model_id="facebook/dinov3-vits16-pretrain-lvd1689m",
         image_size=224,
+        transform=None,
     ):
         self.h5_x_path = h5_x
         self.h5_y_path = h5_y
@@ -21,6 +22,7 @@ class PCamH5HF(Dataset):
 
         self.proc = AutoImageProcessor.from_pretrained(model_id)
         self.size = {"height": image_size, "width": image_size}
+        self.transform = transform
 
     def _ensure_open(self):
         if self.fx is None:
@@ -37,6 +39,9 @@ class PCamH5HF(Dataset):
         x = self.fx["x"][i]  # uint8 HxWx3 #type:ignore
         y = int(self.fy["y"][i])  # type:ignore
         img = Image.fromarray(x)  # type:ignore
+        if self.transform is not None:
+            img = self.transform(img)
+
         # pass size at call-time; let processor handle resize+normalize
         out = self.proc(images=img, return_tensors="pt", size=self.size)
         return out["pixel_values"].squeeze(0), torch.tensor(y, dtype=torch.long)

@@ -58,6 +58,7 @@ baseline:
 		--train_norms_bias $(TRAIN_NORMS_BIAS) --lr_norms_bias $(LR_NORMS_BIAS) \
 		--warmup_steps $(WARMUP_STEPS) --grad_clip $(GRAD_CLIP) \
 		--label_smoothing $(LABEL_SMOOTHING) \
+		--aug_histology --tta_eval \
 		--save_best
 
 debug:
@@ -76,7 +77,7 @@ debug:
 		--max_eval_batches 1 \
 		--skip_bench \
 		--warmup_steps 0 --grad_clip $(GRAD_CLIP) \
-		--label_smoothing $(LABEL_SMOOTHING) \
+		--label_smoothing $(LABEL_SMOOTHING)
 
 SLURM_PARTITION ?= tau
 SLURM_TIME ?= 24:00:00
@@ -115,6 +116,7 @@ COMMON = $(PY) -m src.train.train_linear \
 	--train_norms_bias $(TRAIN_NORMS_BIAS) --lr_norms_bias $(LR_NORMS_BIAS) \
 	--warmup_steps $(WARMUP_STEPS) --grad_clip $(GRAD_CLIP) \
 	--label_smoothing $(LABEL_SMOOTHING) \
+	--aug_histology --tta_eval \
   --save_best
 
 .PHONY: common

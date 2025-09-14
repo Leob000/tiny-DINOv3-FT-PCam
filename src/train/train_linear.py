@@ -7,6 +7,8 @@ from typing import Dict
 import numpy as np
 import torch
 import torch.nn as nn
+import torchvision.transforms as T
+from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -77,14 +79,38 @@ def evaluate_loss(model, loader, device, crit, max_batches=0):
     return total_loss / max(1, total_n)
 
 
-def evaluate(model, loader, device, max_batches=0):
+@torch.no_grad()
+def _predict_proba(model, x, device):
+    # x: [B,3,H,W]
+    return torch.softmax(model(pixel_values=x.to(device, non_blocking=True)), dim=1)[
+        :, 1
+    ]
+
+
+@torch.no_grad()
+def predict_tta(model, x, device):
+    """Average probs over identity, H/V flips, and 90° rotations."""
+    outs = []
+    outs.append(_predict_proba(model, x, device))
+    outs.append(_predict_proba(model, torch.flip(x, dims=[-1]), device))  # H
+    outs.append(_predict_proba(model, torch.flip(x, dims=[-2]), device))  # V
+    outs.append(_predict_proba(model, torch.rot90(x, 1, dims=[-2, -1]), device))  # 90
+    outs.append(_predict_proba(model, torch.rot90(x, 2, dims=[-2, -1]), device))  # 180
+    outs.append(_predict_proba(model, torch.rot90(x, 3, dims=[-2, -1]), device))  # 270
+    return torch.stack(outs, dim=0).mean(0)
+
+
+def evaluate(model, loader, device, max_batches=0, use_tta=False):
     model.eval()
     probs, labels = [], []
     with torch.inference_mode():
         for bi, (x, y) in enumerate(loader, start=1):
-            x = x.to(device, non_blocking=True)
-            logits = model(pixel_values=x)
-            p = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+            if use_tta:
+                p = predict_tta(model, x, device).cpu().numpy()
+            else:
+                x = x.to(device, non_blocking=True)
+                logits = model(pixel_values=x)
+                p = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
             probs.append(p)
             labels.append(y.numpy())
             if max_batches and bi >= max_batches:
@@ -92,6 +118,24 @@ def evaluate(model, loader, device, max_batches=0):
     p = np.concatenate(probs) if probs else np.array([0.5], dtype=np.float32)
     y = np.concatenate(labels) if labels else np.array([0], dtype=np.int64)
     return eval_binary_scores(p, y)
+
+
+def evaluate_probs(model, loader, device, max_batches=0, use_tta=False):
+    model.eval()
+    probs, labels = [], []
+    with torch.inference_mode():
+        for bi, (x, y) in enumerate(loader, start=1):
+            if use_tta:
+                p = predict_tta(model, x, device).cpu().numpy()
+            else:
+                x = x.to(device, non_blocking=True)
+                logits = model(pixel_values=x)
+                p = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+            probs.append(p)
+            labels.append(y.numpy())
+            if max_batches and bi >= max_batches:
+                break
+    return np.concatenate(probs), np.concatenate(labels)
 
 
 def time_latency(model, loader, device, warmup=20, iters=100, max_batches=0):
@@ -265,6 +309,20 @@ def save_checkpoint_lora(path: str, model: nn.Module, args, extra=None):
     torch.save(payload, path)
 
 
+class RandomRotate90:
+    """Rotate PIL image by k*90 degrees with k in {0,1,2,3}."""
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        k = torch.randint(0, 4, ()).item()
+        if k == 1:
+            return img.transpose(Image.ROTATE_90)  # type:ignore
+        if k == 2:
+            return img.transpose(Image.ROTATE_180)  # type:ignore
+        if k == 3:
+            return img.transpose(Image.ROTATE_270)  # type:ignore
+        return img
+
+
 def main():
     import wandb
 
@@ -410,6 +468,16 @@ def main():
         action="store_true",
         help="At epoch-0 eval, also compute AUROC/AUPRC/ECE/etc.",
     )
+    ap.add_argument(
+        "--aug_histology",
+        action="store_true",
+        help="Enable histology-friendly training augmentations (flips/rot90/color jitter).",
+    )
+    ap.add_argument(
+        "--tta_eval",
+        action="store_true",
+        help="Enable test-time augmentation (flips + 90° rotations) for val/test heavy evals.",
+    )
     args = ap.parse_args()
     EVAL_K = max(0, int(args.max_eval_batches))
 
@@ -466,23 +534,38 @@ def main():
             args.data_dir, f"camelyonpatch_level_2_split_{split}_{kind}.h5"
         )
 
+    train_tf = None
+    if args.aug_histology:
+        # Mild, histology-safe augmentations
+        train_tf = T.Compose(
+            [
+                T.RandomHorizontalFlip(),
+                T.RandomVerticalFlip(),
+                RandomRotate90(),
+                T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.03),
+            ]
+        )
+
     train_ds = PCamH5HF(
         h5p("train", "x"),
         h5p("train", "y"),
         model_id=args.model_id,
         image_size=args.resolution,
+        transform=train_tf,
     )
     val_ds = PCamH5HF(
         h5p("valid", "x"),
         h5p("valid", "y"),
         model_id=args.model_id,
         image_size=args.resolution,
+        transform=None,
     )
     test_ds = PCamH5HF(
         h5p("test", "x"),
         h5p("test", "y"),
         model_id=args.model_id,
         image_size=args.resolution,
+        transform=None,
     )
 
     tr = DataLoader(
@@ -869,9 +952,14 @@ def main():
     if best_state is not None:
         model.load_state_dict(best_state["state_dict"], strict=True)
 
-    # Full heavy evals (AUROC/AUPRC/etc.). Use full sets; set max_batches=0 explicitly.
-    val_metrics_full = evaluate(model, va_full, device, max_batches=EVAL_K)
-    test_metrics_full = evaluate(model, te_full, device, max_batches=EVAL_K)
+    # Final heavy evals
+    val_metrics_full = evaluate(
+        model, va_full, device, max_batches=EVAL_K, use_tta=args.tta_eval
+    )
+    test_metrics_full = evaluate(
+        model, te_full, device, max_batches=EVAL_K, use_tta=args.tta_eval
+    )
+
     print("Final evaluation done.")
 
     # Systems metrics
