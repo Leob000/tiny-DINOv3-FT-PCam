@@ -9,6 +9,7 @@ get-data:
 	$(PY) -m scripts.download_pcam --out $(DATA_DIR)
 
 METHOD?=head_only
+SELECT_METRIC?=auroc
 WANDB?=--wandb
 NUM_WORKERS?=4
 EPOCHS?=8
@@ -38,6 +39,7 @@ baseline:
 	$(PY) -m src.train.train_linear \
 		--data_dir $(DATA_DIR) \
 		--model_id $(MODEL_ID) \
+    --select_metric $(SELECT_METRIC) \
 		--resolution $(RESOLUTION) \
 		--batch_size $(BATCH_SIZE) \
 		--val_batch_size $(VAL_BATCH_SIZE) \
@@ -46,7 +48,6 @@ baseline:
 		--weight_decay $(WEIGHT_DECAY) \
 		--num_workers $(NUM_WORKERS) \
 		$(WANDB) --wandb_project dinov3-pcam-compress \
-		--skip_bench \
 		--method $(METHOD) \
 		--train_log_every_steps 4 \
 		--val_eval_frac $(VAL_EVAL_FRAC) \
@@ -99,13 +100,13 @@ SBATCH = sbatch \
 COMMON = $(PY) -m src.train.train_linear \
   --data_dir $(DATA_DIR) \
   --model_id $(MODEL_ID) \
+  --select_metric $(SELECT_METRIC) \
 	--method $(METHOD) \
   --resolution $(RESOLUTION) \
   --num_workers $(NUM_WORKERS) \
   --batch_size $(BATCH_SIZE) --val_batch_size $(VAL_BATCH_SIZE) \
   --epochs $(EPOCHS) --lr $(LR) --weight_decay $(WEIGHT_DECAY) \
   $(WANDB) --wandb_project dinov3-pcam-compress \
-  --skip_bench \
   --train_log_every_steps 4 \
   --val_eval_frac $(VAL_EVAL_FRAC) \
   $(VAL_FLAGS_NO_MID) \

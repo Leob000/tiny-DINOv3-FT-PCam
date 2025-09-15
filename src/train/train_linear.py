@@ -478,6 +478,25 @@ def main():
         action="store_true",
         help="Enable test-time augmentation (flips + 90° rotations) for val/test heavy evals.",
     )
+    ap.add_argument(
+        "--select_metric",
+        type=str,
+        default="auroc",
+        choices=["val_loss", "auroc", "sens95", "nll", "brier", "ece", "acc"],
+        help="Metric to select the best epoch/checkpoint. "
+        "'auroc' = maximize AUROC; 'val_loss'/'nll'/'brier'/'ece' = minimize; "
+        "'sens95'/'acc' = maximize.",
+    )
+
+    def _is_better(new, best, metric):
+        maximize = {"auroc", "sens95", "acc"}
+        minimize = {"val_loss", "nll", "brier", "ece"}
+        if metric in maximize:
+            return (best is None) or (new > best)
+        if metric in minimize:
+            return (best is None) or (new < best)
+        raise ValueError(f"Unknown select_metric: {metric}")
+
     args = ap.parse_args()
     EVAL_K = max(0, int(args.max_eval_batches))
 
@@ -893,19 +912,49 @@ def main():
                 "val/_scope": "epoch_end_full",
             }
 
-            if args.val_heavy_end:
+            # ensure heavy metrics if we need them for selection (no TTA for selection)
+            end_metrics = None
+            need_heavy = args.val_heavy_end or (args.select_metric != "val_loss")
+            if need_heavy:
                 end_metrics = evaluate(model, va_full, device, max_batches=EVAL_K)
-                log_dict.update(
-                    {
-                        "val/AUROC": end_metrics["AUROC"],
-                        "val/AUPRC": end_metrics["AUPRC"],
-                        "val/NLL": end_metrics["NLL"],
-                        "val/Brier": end_metrics["Brier"],
-                        "val/ECE": end_metrics["ECE"],
-                        "val/Acc@0.5": end_metrics["Acc@0.5"],
-                        "val/Sens@95%Spec": end_metrics["Sens@95%Spec"],
-                    }
-                )
+                if args.val_heavy_end:
+                    log_dict.update(
+                        {
+                            "val/AUROC": end_metrics["AUROC"],
+                            "val/AUPRC": end_metrics["AUPRC"],
+                            "val/NLL": end_metrics["NLL"],
+                            "val/Brier": end_metrics["Brier"],
+                            "val/ECE": end_metrics["ECE"],
+                            "val/Acc@0.5": end_metrics["Acc@0.5"],
+                            "val/Sens@95%Spec": end_metrics["Sens@95%Spec"],
+                        }
+                    )
+            # pick selection value
+            if args.select_metric == "val_loss":
+                sel_value = float(val_loss_epoch_end)
+            elif args.select_metric == "auroc":
+                sel_value = float(end_metrics["AUROC"])  # type:ignore
+            elif args.select_metric == "sens95":
+                sel_value = float(end_metrics["Sens@95%Spec"])  # type:ignore
+            elif args.select_metric == "nll":
+                sel_value = float(end_metrics["NLL"])  # type:ignore
+            elif args.select_metric == "brier":
+                sel_value = float(end_metrics["Brier"])  # type:ignore
+            elif args.select_metric == "ece":
+                sel_value = float(end_metrics["ECE"])  # type:ignore
+            elif args.select_metric == "acc":
+                sel_value = float(end_metrics["Acc@0.5"])  # type:ignore
+            else:
+                raise ValueError(f"Unknown select_metric: {args.select_metric}")
+
+            # tie-breaker: prefer lower NLL if sel is effectively equal
+            tie_value = (
+                float(end_metrics["NLL"]) if end_metrics is not None else float("inf")
+            )
+            log_dict["select/metric"] = args.select_metric
+            log_dict["select/value"] = sel_value
+            log_dict["select/tie_nll"] = tie_value
+
             log_dict.update(
                 build_lr_log(opt, prefix="epoch_end", global_step=global_step)
             )
@@ -916,17 +965,30 @@ def main():
             )
             model.train(was_training)
 
-            # Track best by epoch-end full val loss (if enabled)
-            if best_state is None or val_loss_epoch_end < best_state["val_loss_full"]:
+            if (
+                (best_state is None)
+                or _is_better(sel_value, best_state["select_value"], args.select_metric)
+                or (
+                    sel_value == best_state["select_value"]
+                    and tie_value < best_state.get("tie_nll", float("inf"))
+                )
+            ):
                 best_state = {
-                    "state_dict": state_dict_cpu(
-                        model
-                    ),  # keep full state for in-run reload
+                    "state_dict": state_dict_cpu(model),
                     "epoch": epoch,
                     "val_loss_full": float(val_loss_epoch_end),
+                    "select_metric": args.select_metric,
+                    "select_value": float(sel_value),
+                    "tie_nll": float(tie_value),
                 }
                 if args.save_best:
-                    extra = {"val_loss_full": float(val_loss_epoch_end), "epoch": epoch}
+                    extra = {
+                        "val_loss_full": float(val_loss_epoch_end),
+                        "epoch": epoch,
+                        "select_metric": args.select_metric,
+                        "select_value": float(sel_value),
+                        "tie_nll": float(tie_value),
+                    }
                     if args.method == "fullft":
                         save_checkpoint_full(
                             os.path.join(run_dir, "best_full.pt"),
@@ -948,6 +1010,15 @@ def main():
                             args,
                             extra=extra,
                         )
+
+            if args.wandb:
+                assert wandb.run is not None
+                wandb.run.summary["select_metric"] = (
+                    best_state.get("select_metric") if best_state else None
+                )
+                wandb.run.summary["select_value"] = (
+                    best_state.get("select_value") if best_state else None
+                )
 
     print("Final evaluation (heavy metrics) on full val & test...")
     if best_state is not None:
