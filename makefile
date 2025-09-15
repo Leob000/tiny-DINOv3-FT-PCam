@@ -1,5 +1,5 @@
-# local: `make model METHOD=head_only` (default METHOD=head_only, other: lora, fullft)
-# Slurm GPU cluster: `make smodel METHOD=head_only` (default METHOD=head_only, other: lora, fullft)
+# local: `make baseline METHOD=head_only` (default METHOD=head_only, other: lora, fullft)
+# Slurm GPU cluster: `make sbaseline METHOD=head_only` (default METHOD=head_only, other: lora, fullft)
 PY=python
 DATA_DIR=src/data/pcam
 MODEL_ID=facebook/dinov3-vits16-pretrain-lvd1689m # Backbone model
@@ -47,7 +47,6 @@ baseline:
 		--lr $(LR) \
 		--weight_decay $(WEIGHT_DECAY) \
 		--num_workers $(NUM_WORKERS) \
-		$(WANDB) --wandb_project dinov3-pcam-compress \
 		--method $(METHOD) \
 		--train_log_every_steps 4 \
 		--val_eval_frac $(VAL_EVAL_FRAC) \
@@ -136,6 +135,6 @@ bash -lc "source /home/tau/lburgund/.bashrc; \
   $(1)"
 endef
 
-smodel:
+sbaseline:
 	mkdir -p slurm
 	$(SBATCH) --wrap='$(call WRAP_CMD,$(COMMON))'

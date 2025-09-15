@@ -8,7 +8,9 @@ import torch.nn.functional as F
 class LoRALinear(nn.Module):
     """
     Drop-in wrapper for nn.Linear with LoRA (A@B) added to the frozen base weight.
-    deltaW = B @ A, where A: [r, in], B: [out, r], scale = alpha / r
+    Efficient low-rank path:
+      y = x W^T + ( (x A^T) B^T ) * scale
+    where A: [r, in], B: [out, r], scale = alpha / r
     """
 
     def __init__(
@@ -24,6 +26,7 @@ class LoRALinear(nn.Module):
         self.alpha = float(alpha)
         self.scale = (self.alpha / self.r) if self.r > 0 else 0.0
         self.drop = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
+        self.merged = False  # if True, A/B are folded into base.weight
 
         # match device & dtype of the frozen base weight
         dev = self.base.weight.device
@@ -45,12 +48,38 @@ class LoRALinear(nn.Module):
             self.register_parameter("B", None)
 
     def forward(self, x):
+        # Base dense matmul
         out = F.linear(x, self.base.weight, self.base.bias)
-        if self.r > 0:
-            # (B @ A) has shape [out, in]
-            delta = torch.matmul(self.B, self.A) * self.scale
-            out = out + F.linear(self.drop(x), delta, None)
+
+        # Low-rank update (no densifying delta!)
+        if self.r > 0 and not self.merged:
+            # xA^T: [*, r]
+            z = F.linear(self.drop(x), self.A.t())
+            # (xA^T)B^T: [*, out]
+            out = out + F.linear(z, self.B.t()) * self.scale
         return out
+
+    @torch.no_grad()
+    def merge(self):
+        """
+        Fold LoRA weights into the frozen base weight for faster inference:
+          W <- W + (B @ A) * scale
+        Safe only when not training A/B anymore.
+        """
+        if self.r == 0 or self.merged:
+            return
+        delta = torch.matmul(self.B, self.A) * self.scale  # [out, in]
+        self.base.weight.add_(delta)
+        self.merged = True
+
+    @torch.no_grad()
+    def unmerge(self):
+        """Revert a previous merge (restores original base.weight)."""
+        if self.r == 0 or not self.merged:
+            return
+        delta = torch.matmul(self.B, self.A) * self.scale
+        self.base.weight.sub_(delta)
+        self.merged = False
 
     @property
     def lora_parameters(self) -> Iterable[nn.Parameter]:
@@ -95,3 +124,18 @@ def inject_lora(
         lora_params.extend(list(wrapped.lora_parameters))
 
     return lora_params
+
+
+# Optional utility for inference-time merging
+@torch.no_grad()
+def merge_all_lora_(root: nn.Module):
+    for m in root.modules():
+        if isinstance(m, LoRALinear):
+            m.merge()
+
+
+@torch.no_grad()
+def unmerge_all_lora_(root: nn.Module):
+    for m in root.modules():
+        if isinstance(m, LoRALinear):
+            m.unmerge()
