@@ -503,6 +503,7 @@ def main():
         wandb.config.update(
             {
                 "method": args.method,
+                "run_name": run_name,
                 "device": get_device(),
                 "model_id": args.model_id,
                 "train_log_every_steps": args.train_log_every_steps,
