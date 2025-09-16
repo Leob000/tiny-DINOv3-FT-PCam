@@ -51,12 +51,12 @@ class LoRALinear(nn.Module):
         # Base dense matmul
         out = F.linear(x, self.base.weight, self.base.bias)
 
-        # Low-rank update (no densifying delta!)
+        # Low-rank update
         if self.r > 0 and not self.merged:
-            # xA^T: [*, r]
-            z = F.linear(self.drop(x), self.A.t())
-            # (xA^T)B^T: [*, out]
-            out = out + F.linear(z, self.B.t()) * self.scale
+            # xA^T: [*, r]  -- pass A (shape [r, in]) so F.linear does x @ A.T
+            z = F.linear(self.drop(x), self.A)
+            # (xA^T)B^T: [*, out] -- pass B (shape [out, r]) so F.linear does z @ B.T
+            out = out + F.linear(z, self.B) * self.scale
         return out
 
     @torch.no_grad()
