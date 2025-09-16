@@ -2,7 +2,7 @@ import argparse
 import math
 import os
 import time
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -62,13 +62,11 @@ def build_cosine_with_warmup(optimizer, warmup_steps: int, total_steps: int):
     """
     warmup_steps = max(0, int(warmup_steps))
     total_steps = max(1, int(total_steps))
-    # ensure we have at least one non-warmup step
     warmup_steps = min(warmup_steps, total_steps - 1)
 
     def lr_lambda(step: int):
         if step < warmup_steps:
             return float(step) / float(max(1, warmup_steps))
-        # cosine phase
         progress = float(step - warmup_steps) / float(
             max(1, total_steps - warmup_steps)
         )
@@ -103,13 +101,11 @@ def enable_and_collect_norms_bias(
                 p.requires_grad = True
                 params.append(p)
 
-    # De-duplicate by id
     uniq = list({id(p): p for p in params}.values())
     return uniq
 
 
 def state_dict_cpu(m: nn.Module) -> Dict[str, torch.Tensor]:
-    # safe for MPS/CUDA: store on CPU
     return {k: v.detach().to("cpu") for k, v in m.state_dict().items()}
 
 
@@ -135,9 +131,6 @@ def save_checkpoint_full(path: str, model: nn.Module, args, extra=None):
 
 
 def save_checkpoint_head(path: str, model: nn.Module, args, extra=None):
-    """
-    Save only classification head weights + minimal metadata.
-    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {
         "type": "head_only",
@@ -151,13 +144,10 @@ def save_checkpoint_head(path: str, model: nn.Module, args, extra=None):
 
 
 def save_checkpoint_lora(path: str, model: nn.Module, args, extra=None):
-    """
-    Save only LoRA adapters (A/B) + classification head + minimal metadata.
-    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {
         "type": "lora",
-        "adapters": lora_adapter_state_dict(model),  # only A/B
+        "adapters": lora_adapter_state_dict(model),
         "head": {k: v.detach().cpu() for k, v in model.head.state_dict().items()},  # type:ignore
         "backbone_model_id": args.model_id,
         "image_size": args.resolution,
@@ -209,8 +199,6 @@ def parse_args():
     ap.add_argument(
         "--lr_lora", type=float, default=None, help="Overrides LR for LoRA params."
     )
-
-    # LoRA hyperparams
     ap.add_argument("--lora_r", type=int, default=8)
     ap.add_argument("--lora_alpha", type=int, default=16)
     ap.add_argument("--lora_dropout", type=float, default=0.0)
@@ -225,7 +213,6 @@ def parse_args():
         action="store_true",
         help="Also apply LoRA to MLP 'up_proj,down_proj'.",
     )
-
     ap.add_argument(
         "--train_log_every_steps",
         type=int,
@@ -346,12 +333,11 @@ def parse_args():
         type=str,
         default="auroc",
         choices=["val_loss", "auroc", "sens95", "nll", "brier", "ece", "acc"],
-        help="Metric to select the best epoch/checkpoint. "
-        "'auroc' = maximize AUROC; 'val_loss'/'nll'/'brier'/'ece' = minimize; "
-        "'sens95'/'acc' = maximize.",
+        help="Metric to select the best epoch/checkpoint. 'auroc' = maximize AUROC; 'val_loss'/'nll'/'brier'/'ece' = minimize; 'sens95'/'acc' = maximize.",
     )
 
     return ap.parse_args()
+
 
 def _is_better(new, best, metric):
     maximize = {"auroc", "sens95", "acc"}
@@ -362,643 +348,706 @@ def _is_better(new, best, metric):
         return (best is None) or (new < best)
     raise ValueError(f"Unknown select_metric: {metric}")
 
-def main():
-    import wandb
 
-    args = parse_args()
-    EVAL_K = max(0, int(args.max_eval_batches))
+class LinearTrainer:
+    def __init__(self, args):
+        self.args = args
+        self.run_name = f"{time.strftime('%Y%m%d-%H%M%S')}-{self.args.method}"
+        self.run_dir = os.path.join(self.args.save_dir, self.run_name)
+        self.eval_batches = max(0, int(self.args.max_eval_batches))
 
-    args.lr_head = args.lr if args.lr_head is None else args.lr_head
-    args.lr_backbone = args.lr if args.lr_backbone is None else args.lr_backbone
-    args.lr_lora = args.lr if args.lr_lora is None else args.lr_lora
+        set_seed(self.args.seed)
+        self.device = get_device()
+        print(f"Device: {self.device}")
 
-    run_name = f"{time.strftime('%Y%m%d-%H%M%S')}-{args.method}"
-    run_dir = os.path.join(args.save_dir, run_name)
-    if args.wandb:
-        if args.wandb_mode:
-            os.environ["WANDB_MODE"] = args.wandb_mode
+        self.wandb = None
+        self.wandb_run = None
+        self._init_wandb()
 
-        wandb.init(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            name=run_name,
-            config=vars(args),
+        (
+            self.train_loader,
+            self.val_loader,
+            self.test_loader,
+        ) = self._build_dataloaders()
+        self.steps_per_epoch = len(self.train_loader)
+        self.effective_steps = min(
+            self.steps_per_epoch,
+            self.args.max_train_batches or self.steps_per_epoch,
+        )
+        self.train_log_every = max(0, int(self.args.train_log_every_steps))
+        self.val_every_steps = self._compute_val_schedule()
+
+        (
+            self.model,
+            self.optimizer,
+            self.scheduler,
+            meta,
+        ) = self._prepare_model_and_optimizer()
+        self.trainable_names = meta["trainable_names"]
+        self.lora_param_count = meta["lora_param_count"]
+        self.params_total = meta["params_total"]
+        self.trainable_count = meta["trainable_count"]
+
+        self.criterion = nn.CrossEntropyLoss(label_smoothing=self.args.label_smoothing)
+        self.global_step = 0
+        self.best_state = None
+
+    def train(self):
+        self._log_system_stats()
+        self._maybe_epoch_zero_eval()
+
+        for epoch in range(1, self.args.epochs + 1):
+            running_loss, train_samples_seen = self._train_epoch(epoch)
+            if self.args.val_epoch_end:
+                mean_loss = running_loss / max(1, train_samples_seen)
+                self._handle_epoch_end_eval(epoch, mean_loss)
+
+        val_metrics, test_metrics, flops, lat_ms, thr = self._final_evaluation()
+        self._print_final_metrics(val_metrics, test_metrics, flops, lat_ms, thr)
+        self._save_last_checkpoint(val_metrics, test_metrics)
+        self._finalize_wandb()
+
+    def _init_wandb(self):
+        if not self.args.wandb:
+            return
+        import wandb
+
+        if self.args.wandb_mode:
+            os.environ["WANDB_MODE"] = self.args.wandb_mode
+
+        run = wandb.init(
+            project=self.args.wandb_project,
+            entity=self.args.wandb_entity,
+            name=self.run_name,
+            config=vars(self.args),  # type:ignore
         )
         wandb.define_metric("global_step")
         wandb.define_metric("train/*", step_metric="global_step")
         wandb.define_metric("val/*", step_metric="global_step")
         wandb.config.update(
             {
-                "method": args.method,
-                "run_name": run_name,
-                "device": get_device(),
-                "model_id": args.model_id,
-                "train_log_every_steps": args.train_log_every_steps,
-                "val_eval_frac": args.val_eval_frac,
-                "val_mid_epoch": args.val_mid_epoch,
-                "val_epoch_end": args.val_epoch_end,
-                "val_heavy_mid": args.val_heavy_mid,
-                "val_heavy_end": args.val_heavy_end,
-                "lr_head": args.lr_head,
-                "lr_backbone": args.lr_backbone,
-                "lr_lora": args.lr_lora,
-                "lora_r": args.lora_r,
-                "lora_alpha": args.lora_alpha,
-                "lora_dropout": args.lora_dropout,
-                "lora_targets": args.lora_targets,
-                "lora_include_mlp": args.lora_include_mlp,
-                "train_norms_bias": args.train_norms_bias,
-                "lr_norms_bias": args.lr_norms_bias,
+                "method": self.args.method,
+                "run_name": self.run_name,
+                "device": self.device,
+                "model_id": self.args.model_id,
+                "train_log_every_steps": self.args.train_log_every_steps,
+                "val_eval_frac": self.args.val_eval_frac,
+                "val_mid_epoch": self.args.val_mid_epoch,
+                "val_epoch_end": self.args.val_epoch_end,
+                "val_heavy_mid": self.args.val_heavy_mid,
+                "val_heavy_end": self.args.val_heavy_end,
+                "lr_head": self.args.lr_head,
+                "lr_backbone": self.args.lr_backbone,
+                "lr_lora": self.args.lr_lora,
+                "lora_r": self.args.lora_r,
+                "lora_alpha": self.args.lora_alpha,
+                "lora_dropout": self.args.lora_dropout,
+                "lora_targets": self.args.lora_targets,
+                "lora_include_mlp": self.args.lora_include_mlp,
+                "train_norms_bias": self.args.train_norms_bias,
+                "lr_norms_bias": self.args.lr_norms_bias,
             }
         )
+        self.wandb = wandb
+        self.wandb_run = run
 
-    set_seed(args.seed)
-    device = get_device()
-    print(f"Device: {device}")
+    def _build_dataloaders(self):
+        def h5p(split, kind):
+            return os.path.join(
+                self.args.data_dir, f"camelyonpatch_level_2_split_{split}_{kind}.h5"
+            )
 
-    # Datasets
-    def h5p(split, kind):
-        return os.path.join(
-            args.data_dir, f"camelyonpatch_level_2_split_{split}_{kind}.h5"
+        train_tf = None
+        if self.args.aug_histology:
+            train_tf = T.Compose(
+                [
+                    T.RandomHorizontalFlip(),
+                    T.RandomVerticalFlip(),
+                    RandomRotate90(),
+                    T.ColorJitter(
+                        brightness=0.1, contrast=0.1, saturation=0.1, hue=0.03
+                    ),
+                ]
+            )
+
+        train_ds = PCamH5HF(
+            h5p("train", "x"),
+            h5p("train", "y"),
+            model_id=self.args.model_id,
+            image_size=self.args.resolution,
+            transform=train_tf,
+        )
+        val_ds = PCamH5HF(
+            h5p("valid", "x"),
+            h5p("valid", "y"),
+            model_id=self.args.model_id,
+            image_size=self.args.resolution,
+            transform=None,
+        )
+        test_ds = PCamH5HF(
+            h5p("test", "x"),
+            h5p("test", "y"),
+            model_id=self.args.model_id,
+            image_size=self.args.resolution,
+            transform=None,
         )
 
-    train_tf = None
-    if args.aug_histology:
-        # Mild, histology-safe augmentations
-        train_tf = T.Compose(
-            [
-                T.RandomHorizontalFlip(),
-                T.RandomVerticalFlip(),
-                RandomRotate90(),
-                T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.03),
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=self.args.batch_size,
+            shuffle=True,
+            num_workers=self.args.num_workers,
+            pin_memory=(self.device == "cuda"),
+            drop_last=True,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=self.args.val_batch_size,
+            shuffle=False,
+            num_workers=self.args.num_workers,
+            persistent_workers=True,
+            pin_memory=(self.device == "cuda"),
+            drop_last=False,
+        )
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=self.args.val_batch_size,
+            shuffle=False,
+            num_workers=self.args.num_workers,
+            persistent_workers=True,
+            pin_memory=(self.device == "cuda"),
+            drop_last=False,
+        )
+        return train_loader, val_loader, test_loader
+
+    def _compute_val_schedule(self) -> int:
+        if not self.args.val_mid_epoch:
+            return 0
+        if not self.args.val_eval_frac or self.args.val_eval_frac <= 0:
+            return 0
+        return max(1, int(round(self.effective_steps * self.args.val_eval_frac)))
+
+    def _prepare_model_and_optimizer(self):
+        backbone = DinoV3Backbone(model_id=self.args.model_id, dtype=torch.float32)
+        model = DinoV3PCam(backbone).to(self.device)
+
+        param_groups = []
+        trainable_names = []
+        lora_param_count = 0
+
+        if self.args.method == "head_only":
+            for p in model.backbone.parameters():
+                p.requires_grad = False
+            param_groups.append(
+                {
+                    "params": model.head.parameters(),
+                    "lr": self.args.lr_head,
+                    "name": "head",
+                }
+            )
+            trainable_names.append("head")
+            nb_params = enable_and_collect_norms_bias(
+                model.backbone.model, self.args.train_norms_bias
+            )
+            if nb_params:
+                lr_nb = (
+                    self.args.lr_norms_bias
+                    if self.args.lr_norms_bias is not None
+                    else self.args.lr_head
+                )
+                param_groups.append(
+                    {
+                        "params": nb_params,
+                        "lr": lr_nb,
+                        "weight_decay": 0.0,
+                        "name": "norms_bias",
+                    }
+                )
+                trainable_names.append("norms_bias")
+
+        elif self.args.method == "fullft":
+            for p in model.parameters():
+                p.requires_grad = True
+            head_params = list(model.head.parameters())
+            bb_params = [
+                p for n, p in model.named_parameters() if not n.startswith("head.")
             ]
-        )
+            param_groups.append(
+                {"params": bb_params, "lr": self.args.lr_backbone, "name": "backbone"}
+            )
+            param_groups.append(
+                {"params": head_params, "lr": self.args.lr_head, "name": "head"}
+            )
+            trainable_names.extend(["backbone", "head"])
 
-    train_ds = PCamH5HF(
-        h5p("train", "x"),
-        h5p("train", "y"),
-        model_id=args.model_id,
-        image_size=args.resolution,
-        transform=train_tf,
-    )
-    val_ds = PCamH5HF(
-        h5p("valid", "x"),
-        h5p("valid", "y"),
-        model_id=args.model_id,
-        image_size=args.resolution,
-        transform=None,
-    )
-    test_ds = PCamH5HF(
-        h5p("test", "x"),
-        h5p("test", "y"),
-        model_id=args.model_id,
-        image_size=args.resolution,
-        transform=None,
-    )
+        elif self.args.method == "lora":
+            for p in model.backbone.parameters():
+                p.requires_grad = False
 
-    tr = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=(device == "cuda"),
-        drop_last=True,
-    )
-    steps_per_epoch = len(tr)
-    # Respect debug mode if train batches capped
-    effective_steps = min(steps_per_epoch, args.max_train_batches or steps_per_epoch)
+            target_keys = [
+                s.strip() for s in self.args.lora_targets.split(",") if s.strip()
+            ]
+            if self.args.lora_include_mlp:
+                target_keys += ["up_proj", "down_proj"]
 
-    # Train logging schedule: every X global steps
-    train_log_every = max(0, int(args.train_log_every_steps))
+            dino_core = model.backbone.model
+            lora_params = inject_lora(
+                dino_core,
+                target_keys=target_keys,
+                r=self.args.lora_r,
+                alpha=self.args.lora_alpha,
+                dropout=self.args.lora_dropout,
+            )
+            model.to(self.device)
 
-    # Validation schedule: every fraction of the epoch (mid-epoch)
-    val_every_steps = 0
-    if args.val_mid_epoch and args.val_eval_frac and args.val_eval_frac > 0:
-        val_every_steps = max(1, int(round(effective_steps * args.val_eval_frac)))
+            nb_params = enable_and_collect_norms_bias(
+                model.backbone.model, self.args.train_norms_bias
+            )
+            if nb_params:
+                lr_nb = (
+                    self.args.lr_norms_bias
+                    if self.args.lr_norms_bias is not None
+                    else self.args.lr_lora
+                )
+                param_groups.append(
+                    {
+                        "params": nb_params,
+                        "lr": lr_nb,
+                        "weight_decay": 0.0,
+                        "name": "norms_bias",
+                    }
+                )
+                trainable_names.append("norms_bias")
 
-    # FULL loaders for heavy metrics at the very end
-    va_full = DataLoader(
-        val_ds,
-        batch_size=args.val_batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        persistent_workers=True,  #  keep workers alive across epochs
-        pin_memory=(device == "cuda"),
-        drop_last=False,
-    )
-    te_full = DataLoader(
-        test_ds,
-        batch_size=args.val_batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        persistent_workers=True,
-        pin_memory=(device == "cuda"),
-        drop_last=False,
-    )
-
-    # Model: backbone + linear head
-    backbone = DinoV3Backbone(model_id=args.model_id, dtype=torch.float32)
-    model = DinoV3PCam(backbone).to(device)
-
-    # Decide what to train
-    param_groups = []
-    trainable_names = []
-    lora_param_count = 0
-    if args.method == "head_only":
-        # freeze backbone
-        for p in model.backbone.parameters():
-            p.requires_grad = False
-        param_groups.append(
-            {"params": model.head.parameters(), "lr": args.lr_head, "name": "head"}
-        )
-        trainable_names.append("head")
-        # Optionally train LayerNorms/bias in the backbone too
-        nb_params = enable_and_collect_norms_bias(
-            model.backbone.model, args.train_norms_bias
-        )
-        if nb_params:
-            lr_nb = (
-                args.lr_norms_bias if args.lr_norms_bias is not None else args.lr_head
+            param_groups.append(
+                {
+                    "params": lora_params,
+                    "lr": self.args.lr_lora,
+                    "weight_decay": 0.0,
+                    "name": "lora",
+                }
             )
             param_groups.append(
                 {
-                    "params": nb_params,
-                    "lr": lr_nb,
-                    "weight_decay": 0.0,
-                    "name": "norms_bias",
+                    "params": model.head.parameters(),
+                    "lr": self.args.lr_head,
+                    "name": "head",
                 }
             )
-            trainable_names.append("norms_bias")
+            trainable_names.extend(["lora", "head"])
+            lora_param_count = sum(p.numel() for p in lora_params)
+        else:
+            raise ValueError(f"Unknown method: {self.args.method}")
 
-    elif args.method == "fullft":
-        # train everything; optionally give head its own LR
-        for p in model.parameters():
-            p.requires_grad = True
-        # two groups so head can learn faster if desired
-        head_params = list(model.head.parameters())
-        bb_params = [
-            p for n, p in model.named_parameters() if not n.startswith("head.")
-        ]
-        param_groups.append(
-            {"params": bb_params, "lr": args.lr_backbone, "name": "backbone"}
+        params_total = count_params(model)
+        trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=self.args.weight_decay)
+        total_steps = max(1, self.args.epochs * max(1, self.effective_steps))
+        scheduler = build_cosine_with_warmup(
+            optimizer, self.args.warmup_steps, total_steps
         )
-        param_groups.append({"params": head_params, "lr": args.lr_head, "name": "head"})
-        trainable_names.extend(["backbone", "head"])
 
-    elif args.method == "lora":
-        # freeze backbone weights
-        for p in model.backbone.parameters():
-            p.requires_grad = False
+        meta = {
+            "trainable_names": trainable_names,
+            "lora_param_count": lora_param_count,
+            "params_total": params_total,
+            "trainable_count": trainable_count,
+        }
+        return model, optimizer, scheduler, meta
 
-        # choose targets
-        target_keys = [s.strip() for s in args.lora_targets.split(",") if s.strip()]
-        if args.lora_include_mlp:
-            target_keys += ["up_proj", "down_proj"]
+    def _log_system_stats(self):
+        log = {
+            "global_step": self.global_step,
+            "systems/params_total": self.params_total,
+            "systems/params_trainable_count": self.trainable_count,
+            "systems/params_trainable_groups": self.trainable_names,
+        }
+        if self.lora_param_count:
+            log["systems/params_lora"] = self.lora_param_count
+        self._wandb_log(log)
+        summary = {
+            "systems/params_total": self.params_total,
+            "systems/params_trainable_count": self.trainable_count,
+            "systems/params_trainable_groups": self.trainable_names,
+        }
+        if self.lora_param_count:
+            summary["systems/params_lora"] = self.lora_param_count
+        self._wandb_summary_update(summary)
 
-        # inject LoRA into the DINOv3 module inside the wrapper
-        dino_core = model.backbone.model
-        lora_params = inject_lora(
-            dino_core,
-            target_keys=target_keys,
-            r=args.lora_r,
-            alpha=args.lora_alpha,
-            dropout=args.lora_dropout,
-        )
-        model.to(device)
-
-        # Optionally train LayerNorms/bias in the backbone along with LoRA
-        nb_params = enable_and_collect_norms_bias(
-            model.backbone.model, args.train_norms_bias
-        )
-        if nb_params:
-            # If unset, follow LoRA LR by default
-            lr_nb = (
-                args.lr_norms_bias if args.lr_norms_bias is not None else args.lr_lora
-            )
-            param_groups.append(
-                {
-                    "params": nb_params,
-                    "lr": lr_nb,
-                    "weight_decay": 0.0,
-                    "name": "norms_bias",
-                }
-            )
-            trainable_names.append("norms_bias")
-
-        # train LoRA params + head
-        param_groups.append(
-            {
-                "params": lora_params,
-                "lr": args.lr_lora,
-                "weight_decay": 0.0,
-                "name": "lora",
-            }
-        )
-        param_groups.append(
-            {"params": model.head.parameters(), "lr": args.lr_head, "name": "head"}
-        )
-        trainable_names.extend(["lora", "head"])
-
-        lora_param_count = sum(p.numel() for p in lora_params)
-    else:
-        raise ValueError(f"Unknown method: {args.method}")
-
-    # Systems stats: params total + trainable (grouped here near param selection)
-    params_total = count_params(model)
-
-    def count_trainable(m: nn.Module) -> int:
-        return sum(p.numel() for p in m.parameters() if p.requires_grad)
-
-    trainable_count = count_trainable(model)
-
-    print(
-        f"Params (total): {params_total:,} | "
-        f"Trainable: {trainable_count:,} ({'+'.join(trainable_names)})"
-    )
-    global_step = 0
-    if args.wandb:
-        # Put them in both the timeline (step 0) and the run summary
-        wandb.log(
-            {
-                "global_step": global_step,
-                "systems/params_total": params_total,
-                "systems/params_trainable_count": trainable_count,
-                "systems/params_trainable_groups": trainable_names,
-                **(
-                    {"systems/params_lora": lora_param_count}
-                    if lora_param_count
-                    else {}
-                ),
-            }
-        )
-        assert wandb.run is not None
-        wandb.run.summary["systems/params_total"] = params_total
-        wandb.run.summary["systems/params_trainable_count"] = trainable_count
-        wandb.run.summary["systems/params_trainable_groups"] = trainable_names
-        if lora_param_count:
-            wandb.run.summary["systems/params_lora"] = lora_param_count
-
-    # build optimizer with param groups
-    opt = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
-
-    # Per-step scheduler: linear warmup then cosine decay across the whole run
-    total_steps = max(1, args.epochs * max(1, effective_steps))
-    scheduler = build_cosine_with_warmup(opt, args.warmup_steps, total_steps)
-
-    crit = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
-
-    # epoch0 evaluation
-    if args.val_epoch0:
+    def _maybe_epoch_zero_eval(self):
+        if not self.args.val_epoch0:
+            return
         t0 = time.time()
-        was_training = model.training
-        val_loss_zero = evaluate_loss(model, va_full, device, crit, max_batches=EVAL_K)
+        val_loss, metrics = self._evaluate_val_full(heavy=self.args.val_heavy_zero)
+        dt = time.time() - t0
         log_dict = {
-            "global_step": 0,  # align with other step-0 logs
+            "global_step": self.global_step,
             "epoch": 0,
-            "val/loss_full": float(val_loss_zero),
+            "val/loss_full": float(val_loss),
             "val/_scope": "epoch0_full",
         }
-        if args.val_heavy_zero:
-            zero_metrics = evaluate(model, va_full, device, max_batches=EVAL_K)
-            log_dict.update(
-                {
-                    "val/AUROC": zero_metrics["AUROC"],
-                    "val/AUPRC": zero_metrics["AUPRC"],
-                    "val/NLL": zero_metrics["NLL"],
-                    "val/Brier": zero_metrics["Brier"],
-                    "val/ECE": zero_metrics["ECE"],
-                    "val/Acc@0.5": zero_metrics["Acc@0.5"],
-                    "val/Sens@95%Spec": zero_metrics["Sens@95%Spec"],
-                }
-            )
-        if args.wandb:
-            wandb.log(log_dict)
-        print(f"[epoch-0 val] full loss={val_loss_zero:.4f} ({time.time() - t0:.2f}s)")
-        model.train(was_training)
+        if self.args.val_heavy_zero and metrics:
+            log_dict.update(self._format_val_metrics(metrics))
+        self._wandb_log(log_dict)
+        print(f"[epoch-0 val] full loss={val_loss:.4f} ({dt:.2f}s)")
 
-    best_state = None
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        pbar = tqdm(tr, desc=f"Epoch {epoch}/{args.epochs}")
+    def _train_epoch(self, epoch: int) -> Tuple[float, int]:
+        self.model.train()
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.args.epochs}")
         running_loss = 0.0
         train_samples_seen = 0
-        global_step = (epoch - 1) * steps_per_epoch  # absolute step across epochs
         since_log_loss_sum = 0.0
         since_log_count = 0
 
-        for bi, (x, y) in enumerate(pbar, start=1):
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            logits = model(pixel_values=x)
-            loss = crit(logits, y)
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            if args.grad_clip and args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            opt.step()
-            scheduler.step()
+        for batch_idx, batch in enumerate(pbar, start=1):
+            loss_val, batch_size = self._train_step(batch)
+            loss_sum = loss_val * batch_size
+            running_loss += loss_sum
+            train_samples_seen += batch_size
+            since_log_loss_sum += loss_sum
+            since_log_count += batch_size
 
-            # accumulate for train window
-            bs = x.size(0)
-            since_log_loss_sum += loss.item() * bs
-            since_log_count += bs
-            running_loss += loss.item() * bs
-            train_samples_seen += bs
-            global_step += 1
-
-            # Train logging: every X global steps
-            if train_log_every > 0 and (global_step % train_log_every) == 0:
+            if (
+                self.train_log_every > 0
+                and (self.global_step % self.train_log_every) == 0
+            ):
                 mean_window_loss = since_log_loss_sum / max(1, since_log_count)
-                if args.wandb:
-                    log = {
-                        "global_step": global_step,
-                        "train/loss_window": float(mean_window_loss),
-                    }
-                    log.update(
-                        build_lr_log(opt, prefix="train", global_step=global_step)
+                log = {
+                    "global_step": self.global_step,
+                    "train/loss_window": float(mean_window_loss),
+                }
+                log.update(
+                    build_lr_log(
+                        self.optimizer, prefix="train", global_step=self.global_step
                     )
-                    wandb.log(log)
+                )
+                self._wandb_log(log)
                 since_log_loss_sum = 0.0
                 since_log_count = 0
 
-            # MID-epoch FULL validation at fraction boundaries (different schedule)
-            mid_boundary = (
-                args.val_mid_epoch
-                and val_every_steps > 0
-                and (((bi % val_every_steps) == 0) or (bi == effective_steps))
-            )
-            if mid_boundary:
-                # Full val set: loss
-                t0 = time.time()
-                was_training = model.training
-                val_loss_mid = evaluate_loss(
-                    model, va_full, device, crit, max_batches=EVAL_K
-                )
-                log_dict = {
-                    "global_step": global_step,
-                    "val/loss_full": float(val_loss_mid),
-                    "val/_scope": "mid_epoch_full",
-                }
+            if self._should_run_mid_eval(batch_idx):
+                self._run_mid_epoch_eval()
 
-                # Optional heavy metrics on full val
-                if args.val_heavy_mid:
-                    mid_metrics = evaluate(model, va_full, device, max_batches=EVAL_K)
-                    log_dict.update(
-                        {
-                            "val/AUROC": mid_metrics["AUROC"],
-                            "val/AUPRC": mid_metrics["AUPRC"],
-                            "val/NLL": mid_metrics["NLL"],
-                            "val/Brier": mid_metrics["Brier"],
-                            "val/ECE": mid_metrics["ECE"],
-                            "val/Acc@0.5": mid_metrics["Acc@0.5"],
-                            "val/Sens@95%Spec": mid_metrics["Sens@95%Spec"],
-                        }
-                    )
-                if args.wandb:
-                    wandb.log(log_dict)
-                print(
-                    f"\n[mid-val] full loss={val_loss_mid:.4f} ({time.time() - t0:.2f}s)"
-                )
-                model.train(was_training)
-
-            if args.max_train_batches and bi >= args.max_train_batches:
+            if self.args.max_train_batches and batch_idx >= self.args.max_train_batches:
                 break
 
-        # END-OF-EPOCH validation
-        val_loss_epoch_end = None
-        if args.val_epoch_end:
-            t0 = time.time()
-            was_training = model.training
-            val_loss_epoch_end = evaluate_loss(
-                model, va_full, device, crit, max_batches=EVAL_K
+        return running_loss, train_samples_seen
+
+    def _train_step(self, batch):
+        x, y = batch
+        x = x.to(self.device, non_blocking=True)
+        y = y.to(self.device, non_blocking=True)
+        logits = self.model(pixel_values=x)
+        loss = self.criterion(logits, y)
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        if self.args.grad_clip and self.args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+        self.optimizer.step()
+        self.scheduler.step()
+        bs = x.size(0)
+        self.global_step += 1
+        return loss.item(), bs
+
+    def _should_run_mid_eval(self, batch_idx: int) -> bool:
+        if not self.args.val_mid_epoch or self.val_every_steps <= 0:
+            return False
+        return (
+            batch_idx % self.val_every_steps
+        ) == 0 or batch_idx == self.effective_steps
+
+    def _run_mid_epoch_eval(self):
+        t0 = time.time()
+        val_loss, metrics = self._evaluate_val_full(heavy=self.args.val_heavy_mid)
+        dt = time.time() - t0
+        log_dict = {
+            "global_step": self.global_step,
+            "val/loss_full": float(val_loss),
+            "val/_scope": "mid_epoch_full",
+        }
+        if self.args.val_heavy_mid and metrics:
+            log_dict.update(self._format_val_metrics(metrics))
+        self._wandb_log(log_dict)
+        print(f"\n[mid-val] full loss={val_loss:.4f} ({dt:.2f}s)")
+
+    def _handle_epoch_end_eval(self, epoch: int, train_loss_epoch: float):
+        t0 = time.time()
+        need_heavy = self.args.val_heavy_end or (self.args.select_metric != "val_loss")
+        val_loss, metrics = self._evaluate_val_full(heavy=need_heavy)
+        dt = time.time() - t0
+        log_dict = {
+            "global_step": self.global_step,
+            "epoch": epoch,
+            "train/loss_epoch": float(train_loss_epoch),
+            "val/loss_full": float(val_loss),
+            "val/_scope": "epoch_end_full",
+        }
+        if self.args.val_heavy_end and metrics:
+            log_dict.update(self._format_val_metrics(metrics))
+
+        sel_value = self._select_metric_value(val_loss, metrics)
+        tie_value = float(metrics["NLL"]) if metrics is not None else float("inf")
+        log_dict["select/metric"] = self.args.select_metric
+        log_dict["select/value"] = float(sel_value)
+        log_dict["select/tie_nll"] = tie_value
+        log_dict.update(
+            build_lr_log(
+                self.optimizer, prefix="epoch_end", global_step=self.global_step
             )
-            log_dict = {
-                "global_step": global_step,  # same x-axis
+        )
+        self._wandb_log(log_dict)
+        print(f"[epoch-end val] full loss={val_loss:.4f} ({dt:.2f}s)")
+
+        self._maybe_update_best(epoch, val_loss, sel_value, tie_value)
+        if self.wandb_run is not None:
+            self.wandb_run.summary["select_metric"] = (
+                self.best_state.get("select_metric") if self.best_state else None
+            )
+            self.wandb_run.summary["select_value"] = (
+                self.best_state.get("select_value") if self.best_state else None
+            )
+
+    def _select_metric_value(
+        self, val_loss: float, metrics: Optional[Dict[str, float]]
+    ):
+        metric = self.args.select_metric
+        if metric == "val_loss":
+            return float(val_loss)
+        if not metrics:
+            raise ValueError("Heavy metrics required for selection")
+        key_map = {
+            "auroc": "AUROC",
+            "sens95": "Sens@95%Spec",
+            "nll": "NLL",
+            "brier": "Brier",
+            "ece": "ECE",
+            "acc": "Acc@0.5",
+        }
+        key = key_map.get(metric)
+        if key is None:
+            raise ValueError(f"Unknown select_metric: {metric}")
+        return float(metrics[key])
+
+    def _maybe_update_best(
+        self, epoch: int, val_loss: float, sel_value: float, tie_value: float
+    ):
+        current_best = (
+            None if self.best_state is None else self.best_state["select_value"]
+        )
+        if (
+            self.best_state is None
+            or _is_better(sel_value, current_best, self.args.select_metric)
+            or (
+                sel_value == self.best_state["select_value"]
+                and tie_value < self.best_state.get("tie_nll", float("inf"))
+            )
+        ):
+            self.best_state = {
+                "state_dict": state_dict_cpu(self.model),
                 "epoch": epoch,
-                "train/loss_epoch": (running_loss / max(1, train_samples_seen)),
-                "val/loss_full": float(val_loss_epoch_end),
-                "val/_scope": "epoch_end_full",
+                "val_loss_full": float(val_loss),
+                "select_metric": self.args.select_metric,
+                "select_value": float(sel_value),
+                "tie_nll": float(tie_value),
             }
-
-            # ensure heavy metrics if we need them for selection (no TTA for selection)
-            end_metrics = None
-            need_heavy = args.val_heavy_end or (args.select_metric != "val_loss")
-            if need_heavy:
-                end_metrics = evaluate(model, va_full, device, max_batches=EVAL_K)
-                if args.val_heavy_end:
-                    log_dict.update(
-                        {
-                            "val/AUROC": end_metrics["AUROC"],
-                            "val/AUPRC": end_metrics["AUPRC"],
-                            "val/NLL": end_metrics["NLL"],
-                            "val/Brier": end_metrics["Brier"],
-                            "val/ECE": end_metrics["ECE"],
-                            "val/Acc@0.5": end_metrics["Acc@0.5"],
-                            "val/Sens@95%Spec": end_metrics["Sens@95%Spec"],
-                        }
-                    )
-            # pick selection value
-            if args.select_metric == "val_loss":
-                sel_value = float(val_loss_epoch_end)
-            elif args.select_metric == "auroc":
-                sel_value = float(end_metrics["AUROC"])  # type:ignore
-            elif args.select_metric == "sens95":
-                sel_value = float(end_metrics["Sens@95%Spec"])  # type:ignore
-            elif args.select_metric == "nll":
-                sel_value = float(end_metrics["NLL"])  # type:ignore
-            elif args.select_metric == "brier":
-                sel_value = float(end_metrics["Brier"])  # type:ignore
-            elif args.select_metric == "ece":
-                sel_value = float(end_metrics["ECE"])  # type:ignore
-            elif args.select_metric == "acc":
-                sel_value = float(end_metrics["Acc@0.5"])  # type:ignore
-            else:
-                raise ValueError(f"Unknown select_metric: {args.select_metric}")
-
-            # tie-breaker: prefer lower NLL if sel is effectively equal
-            tie_value = (
-                float(end_metrics["NLL"]) if end_metrics is not None else float("inf")
-            )
-            log_dict["select/metric"] = args.select_metric
-            log_dict["select/value"] = sel_value
-            log_dict["select/tie_nll"] = tie_value
-
-            log_dict.update(
-                build_lr_log(opt, prefix="epoch_end", global_step=global_step)
-            )
-            if args.wandb:
-                wandb.log(log_dict)
-            print(
-                f"[epoch-end val] full loss={val_loss_epoch_end:.4f} ({time.time() - t0:.2f}s)"
-            )
-            model.train(was_training)
-
-            if (
-                (best_state is None)
-                or _is_better(sel_value, best_state["select_value"], args.select_metric)
-                or (
-                    sel_value == best_state["select_value"]
-                    and tie_value < best_state.get("tie_nll", float("inf"))
-                )
-            ):
-                best_state = {
-                    "state_dict": state_dict_cpu(model),
+            if self.args.save_best:
+                extra = {
+                    "val_loss_full": float(val_loss),
                     "epoch": epoch,
-                    "val_loss_full": float(val_loss_epoch_end),
-                    "select_metric": args.select_metric,
+                    "select_metric": self.args.select_metric,
                     "select_value": float(sel_value),
                     "tie_nll": float(tie_value),
                 }
-                if args.save_best:
-                    extra = {
-                        "val_loss_full": float(val_loss_epoch_end),
-                        "epoch": epoch,
-                        "select_metric": args.select_metric,
-                        "select_value": float(sel_value),
-                        "tie_nll": float(tie_value),
-                    }
-                    if args.method == "fullft":
-                        save_checkpoint_full(
-                            os.path.join(run_dir, "best_full.pt"),
-                            model,
-                            args,
-                            extra=extra,
-                        )
-                    elif args.method == "lora":
-                        save_checkpoint_lora(
-                            os.path.join(run_dir, "best_lora.pt"),
-                            model,
-                            args,
-                            extra=extra,
-                        )
-                    elif args.method == "head_only":
-                        save_checkpoint_head(
-                            os.path.join(run_dir, "best_head.pt"),
-                            model,
-                            args,
-                            extra=extra,
-                        )
+                self._save_checkpoint("best", extra)
 
-            if args.wandb:
-                assert wandb.run is not None
-                wandb.run.summary["select_metric"] = (
-                    best_state.get("select_metric") if best_state else None
-                )
-                wandb.run.summary["select_value"] = (
-                    best_state.get("select_value") if best_state else None
-                )
-
-    print("Final evaluation (heavy metrics) on full val & test...")
-    if best_state is not None:
-        model.load_state_dict(best_state["state_dict"], strict=True)
-
-    # Final heavy evals
-    val_metrics_full = evaluate(
-        model, va_full, device, max_batches=EVAL_K, use_tta=args.tta_eval
-    )
-    test_metrics_full = evaluate(
-        model, te_full, device, max_batches=EVAL_K, use_tta=args.tta_eval
-    )
-
-    print("Final evaluation done.")
-
-    # Systems metrics
-    flops = None
-    lat_ms, thr = float("nan"), float("nan")
-    if not args.skip_bench:
-        print("FLOPs & Latency: computing")
-        flops = try_flops(model, img_size=args.resolution, device=device)
-        lat_ms, thr = time_latency(
-            model,
-            te_full,
-            device=device,
-            warmup=args.lat_warmup,
-            iters=args.lat_iters,
-            max_batches=EVAL_K,
+    def _evaluate_val_full(self, heavy: bool):
+        was_training = self.model.training
+        val_loss = evaluate_loss(
+            self.model,
+            self.val_loader,
+            self.device,
+            self.criterion,
+            max_batches=self.eval_batches,
         )
-        print("FLOPs & Latency: done")
-        if args.wandb:
-            # also log to the timeline (with the final global_step for nice x-axis)
-            wandb.log(
+        metrics = None
+        if heavy:
+            metrics = evaluate(
+                self.model,
+                self.val_loader,
+                self.device,
+                max_batches=self.eval_batches,
+            )
+        self.model.train(was_training)
+        return float(val_loss), metrics
+
+    def _evaluate_metrics(self, loader, use_tta: bool = False):
+        was_training = self.model.training
+        metrics = evaluate(
+            self.model,
+            loader,
+            self.device,
+            max_batches=self.eval_batches,
+            use_tta=use_tta,
+        )
+        self.model.train(was_training)
+        return metrics
+
+    def _format_val_metrics(self, metrics: Dict[str, float]) -> Dict[str, float]:
+        return {
+            "val/AUROC": metrics["AUROC"],
+            "val/AUPRC": metrics["AUPRC"],
+            "val/NLL": metrics["NLL"],
+            "val/Brier": metrics["Brier"],
+            "val/ECE": metrics["ECE"],
+            "val/Acc@0.5": metrics["Acc@0.5"],
+            "val/Sens@95%Spec": metrics["Sens@95%Spec"],
+        }
+
+    def _final_evaluation(self):
+        print("Final evaluation (heavy metrics) on full val & test...")
+        if self.best_state is not None:
+            self.model.load_state_dict(self.best_state["state_dict"], strict=True)
+
+        val_metrics_full = self._evaluate_metrics(
+            self.val_loader, use_tta=self.args.tta_eval
+        )
+        test_metrics_full = self._evaluate_metrics(
+            self.test_loader, use_tta=self.args.tta_eval
+        )
+        print("Final evaluation done.")
+
+        flops = None
+        lat_ms, thr = float("nan"), float("nan")
+        if not self.args.skip_bench:
+            print("FLOPs & Latency: computing")
+            flops = try_flops(
+                self.model, img_size=self.args.resolution, device=self.device
+            )
+            lat_ms, thr = time_latency(
+                self.model,
+                self.test_loader,
+                device=self.device,
+                warmup=self.args.lat_warmup,
+                iters=self.args.lat_iters,
+                max_batches=self.eval_batches,
+            )
+            print("FLOPs & Latency: done")
+            self._wandb_log(
                 {
-                    "global_step": global_step,
-                    "systems/flops_g": (flops if flops is not None else None),
+                    "global_step": self.global_step,
+                    "systems/flops_g": flops,
                     "systems/latency_ms": lat_ms,
                     "systems/throughput_img_s": thr,
                 }
             )
-            # and store in run summary
-            assert wandb.run is not None
-            wandb.run.summary.update(
+            self._wandb_summary_update(
                 {
-                    "systems/flops_g": (flops if flops is not None else None),
+                    "systems/flops_g": flops,
                     "systems/latency_ms": lat_ms,
                     "systems/throughput_img_s": thr,
                 }
             )
 
-    if args.wandb:
-        wandb.log(
-            {
-                # final full VAL metrics
-                "final/val/AUROC": val_metrics_full["AUROC"],
-                "final/val/AUPRC": val_metrics_full["AUPRC"],
-                "final/val/NLL": val_metrics_full["NLL"],
-                "final/val/Brier": val_metrics_full["Brier"],
-                "final/val/ECE": val_metrics_full["ECE"],
-                "final/val/Acc@0.5": val_metrics_full["Acc@0.5"],
-                "final/val/Sens@95%Spec": val_metrics_full["Sens@95%Spec"],
-                # final full TEST metrics
-                "test/AUROC": test_metrics_full["AUROC"],
-                "test/AUPRC": test_metrics_full["AUPRC"],
-                "test/NLL": test_metrics_full["NLL"],
-                "test/Brier": test_metrics_full["Brier"],
-                "test/ECE": test_metrics_full["ECE"],
-                "test/Acc@0.5": test_metrics_full["Acc@0.5"],
-                "test/Sens@95%Spec": test_metrics_full["Sens@95%Spec"],
-            }
-        )
+        final_log = {
+            "final/val/AUROC": val_metrics_full["AUROC"],
+            "final/val/AUPRC": val_metrics_full["AUPRC"],
+            "final/val/NLL": val_metrics_full["NLL"],
+            "final/val/Brier": val_metrics_full["Brier"],
+            "final/val/ECE": val_metrics_full["ECE"],
+            "final/val/Acc@0.5": val_metrics_full["Acc@0.5"],
+            "final/val/Sens@95%Spec": val_metrics_full["Sens@95%Spec"],
+            "test/AUROC": test_metrics_full["AUROC"],
+            "test/AUPRC": test_metrics_full["AUPRC"],
+            "test/NLL": test_metrics_full["NLL"],
+            "test/Brier": test_metrics_full["Brier"],
+            "test/ECE": test_metrics_full["ECE"],
+            "test/Acc@0.5": test_metrics_full["Acc@0.5"],
+            "test/Sens@95%Spec": test_metrics_full["Sens@95%Spec"],
+        }
+        final_log["global_step"] = self.global_step
+        self._wandb_log(final_log)  # type:ignore
 
+        return val_metrics_full, test_metrics_full, flops, lat_ms, thr
+
+    def _print_final_metrics(
+        self,
+        val_metrics_full: Dict[str, float],
+        test_metrics_full: Dict[str, float],
+        flops: Optional[float],
+        lat_ms: float,
+        thr: float,
+    ):
+        print("\n== Final VAL metrics ==")
+        for k, v in val_metrics_full.items():
+            print(f"{k}: {v:.4f}")
+
+        print("\n== Final TEST metrics ==")
+        for k, v in test_metrics_full.items():
+            print(f"{k}: {v:.4f}")
+        print(f"FLOPs (G): {flops if flops is not None else 'N/A'}")
+        print(f"Latency (ms/img): {lat_ms:.2f} | Throughput (img/s): {thr:.2f}")
+
+    def _save_last_checkpoint(self, val_metrics, test_metrics):
+        if not self.args.save_last:
+            return
+        extra = {
+            "final_val": val_metrics,
+            "final_test": test_metrics,
+            "epoch": self.args.epochs,
+        }
+        self._save_checkpoint("last", extra)
+
+    def _save_checkpoint(self, prefix: str, extra):
+        filename = self._checkpoint_filename(prefix)
+        path = os.path.join(self.run_dir, filename)
+        if self.args.method == "fullft":
+            save_checkpoint_full(path, self.model, self.args, extra=extra)
+        elif self.args.method == "lora":
+            save_checkpoint_lora(path, self.model, self.args, extra=extra)
+        elif self.args.method == "head_only":
+            save_checkpoint_head(path, self.model, self.args, extra=extra)
+        else:
+            raise ValueError(f"Unknown method: {self.args.method}")
+
+    def _checkpoint_filename(self, prefix: str) -> str:
+        if self.args.method == "fullft":
+            return f"{prefix}_full.pt"
+        if self.args.method == "lora":
+            return f"{prefix}_lora.pt"
+        if self.args.method == "head_only":
+            return f"{prefix}_head.pt"
+        raise ValueError(f"Unknown method: {self.args.method}")
+
+    def _finalize_wandb(self):
+        if self.wandb_run is None or self.wandb is None:
+            return
         best_val_loss = None
         best_epoch = None
-        if best_state is not None:
-            best_val_loss = best_state.get(
-                "val_loss_full", best_state.get("val_loss_epoch")
-            )
-            best_epoch = best_state.get("epoch")
-        wandb.run.summary["best_epoch"] = best_epoch  # type: ignore
-        wandb.run.summary["best_val_loss"] = best_val_loss  # type: ignore
-        wandb.finish()
+        if self.best_state is not None:
+            best_val_loss = self.best_state.get("val_loss_full")
+            best_epoch = self.best_state.get("epoch")
+        self.wandb_run.summary["best_epoch"] = best_epoch
+        self.wandb_run.summary["best_val_loss"] = best_val_loss
+        self.wandb.finish()
 
-    print("\n== Final VAL metrics ==")
-    for k, v in val_metrics_full.items():
-        print(f"{k}: {v:.4f}")
+    def _wandb_log(self, payload: Dict[str, object]):
+        if self.wandb is not None:
+            self.wandb.log(payload)
 
-    print("\n== Final TEST metrics ==")
-    for k, v in test_metrics_full.items():
-        print(f"{k}: {v:.4f}")
-    print(f"FLOPs (G): {flops if flops is not None else 'N/A'}")
-    print(f"Latency (ms/img): {lat_ms:.2f} | Throughput (img/s): {thr:.2f}")
+    def _wandb_summary_update(self, payload: Dict[str, object]):
+        if self.wandb_run is not None:
+            self.wandb_run.summary.update(payload)
 
-    # Save last checkpoint if requested
-    if args.save_last:
-        extra = {
-            "final_val": val_metrics_full,
-            "final_test": test_metrics_full,
-            "epoch": args.epochs,
-        }
-        if args.method == "fullft":
-            save_checkpoint_full(
-                os.path.join(run_dir, "last_full.pt"), model, args, extra=extra
-            )
-        elif args.method == "lora":
-            save_checkpoint_lora(
-                os.path.join(run_dir, "last_lora.pt"), model, args, extra=extra
-            )
-        elif args.method == "head_only":
-            save_checkpoint_head(
-                os.path.join(run_dir, "last_head.pt"), model, args, extra=extra
-            )
+
+def main():
+    args = parse_args()
+    args.lr_head = args.lr if args.lr_head is None else args.lr_head
+    args.lr_backbone = args.lr if args.lr_backbone is None else args.lr_backbone
+    args.lr_lora = args.lr if args.lr_lora is None else args.lr_lora
+
+    trainer = LinearTrainer(args)
+    trainer.train()
 
 
 if __name__ == "__main__":

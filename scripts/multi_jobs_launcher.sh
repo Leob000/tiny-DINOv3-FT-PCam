@@ -1,15 +1,15 @@
-# make sbaseline METHOD=head_only \
-#   WARMUP_STEPS=400 \
-#   TRAIN_NORMS_BIAS=both LR_HEAD=2.5e-4 LR_NORMS_BIAS=1e-4 \
-#   RESOLUTION=224
-
-make sbaseline METHOD=lora \
-  LORA_R=8 LORA_ALPHA=16 LORA_DROPOUT=0.1 \
-  LORA_TARGETS="q_proj,k_proj,v_proj,o_proj" \
-  LR_HEAD=5e-4 LR_LORA=2.5e-4 LR_NORMS_BIAS=2.5e-4 \
+make sbaseline METHOD=head_only \
   WARMUP_STEPS=400 \
-  TRAIN_NORMS_BIAS=both \
+  TRAIN_NORMS_BIAS=both LR_HEAD=2.5e-4 LR_NORMS_BIAS=1e-4 \
   RESOLUTION=224
+
+# make sbaseline METHOD=lora \
+#   LORA_R=8 LORA_ALPHA=16 LORA_DROPOUT=0.1 \
+#   LORA_TARGETS="q_proj,k_proj,v_proj,o_proj" \
+#   LR_HEAD=5e-4 LR_LORA=2.5e-4 LR_NORMS_BIAS=2.5e-4 \
+#   WARMUP_STEPS=400 \
+#   TRAIN_NORMS_BIAS=both \
+#   RESOLUTION=224
 
 # make sbaseline METHOD=fullft \
 #   LR=5e-5 WEIGHT_DECAY=0.05 \
