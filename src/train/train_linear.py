@@ -4,7 +4,6 @@ import os
 import time
 from typing import Dict
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
@@ -15,45 +14,14 @@ from tqdm import tqdm
 from src.data.pcam_hf import PCamH5HF
 from src.models.backbone_dinov3 import DinoV3Backbone, DinoV3PCam
 from src.models.lora import LoRALinear, inject_lora
-from src.utils.metrics import eval_binary_scores
+from src.utils.eval_utils import (
+    count_params,
+    try_flops,
+    get_device,
+    evaluate,
+    time_latency,
+)
 from src.utils.seed import set_seed
-
-
-# Optional FLOPs (safe fallback if ptflops not installed or fails)
-def try_flops(model, img_size=224, device="cpu"):
-    try:
-        from ptflops import get_model_complexity_info
-
-        class Wrap(torch.nn.Module):
-            def __init__(self, m):
-                super().__init__()
-                self.m = m
-
-            def forward(self, x):
-                return self.m(pixel_values=x)
-
-        wrap = Wrap(model).to(device)
-        macs, _ = get_model_complexity_info(
-            wrap,
-            (3, img_size, img_size),
-            as_strings=False,
-            print_per_layer_stat=False,
-            verbose=False,
-        )
-        assert isinstance(macs, (int, float)), f"macs type is {type(macs)}"
-        return float(macs * 2 / 1e9)  # GFLOPs (MACs->FLOPs x2)
-    except Exception:
-        return None
-
-
-def count_params(model):
-    return sum(p.numel() for p in model.parameters())
-
-
-def get_device():
-    if torch.backends.mps.is_available():
-        return "mps"
-    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def evaluate_loss(model, loader, device, crit, max_batches=0):
@@ -77,109 +45,6 @@ def evaluate_loss(model, loader, device, crit, max_batches=0):
             if max_batches and bi >= max_batches:
                 break
     return total_loss / max(1, total_n)
-
-
-@torch.no_grad()
-def _predict_proba(model, x, device):
-    # x: [B,3,H,W]
-    return torch.softmax(model(pixel_values=x.to(device, non_blocking=True)), dim=1)[
-        :, 1
-    ]
-
-
-@torch.no_grad()
-def predict_tta(model, x, device):
-    """Average probs over identity, H/V flips, and 90° rotations."""
-    outs = []
-    outs.append(_predict_proba(model, x, device))
-    outs.append(_predict_proba(model, torch.flip(x, dims=[-1]), device))  # H
-    outs.append(_predict_proba(model, torch.flip(x, dims=[-2]), device))  # V
-    outs.append(_predict_proba(model, torch.rot90(x, 1, dims=[-2, -1]), device))  # 90
-    outs.append(_predict_proba(model, torch.rot90(x, 2, dims=[-2, -1]), device))  # 180
-    outs.append(_predict_proba(model, torch.rot90(x, 3, dims=[-2, -1]), device))  # 270
-    return torch.stack(outs, dim=0).mean(0)
-
-
-def evaluate(model, loader, device, max_batches=0, use_tta=False):
-    model.eval()
-    probs, labels = [], []
-    with torch.inference_mode():
-        for bi, (x, y) in enumerate(loader, start=1):
-            if use_tta:
-                p = predict_tta(model, x, device).cpu().numpy()
-            else:
-                x = x.to(device, non_blocking=True)
-                logits = model(pixel_values=x)
-                p = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-            probs.append(p)
-            labels.append(y.numpy())
-            if max_batches and bi >= max_batches:
-                break
-    p = np.concatenate(probs) if probs else np.array([0.5], dtype=np.float32)
-    y = np.concatenate(labels) if labels else np.array([0], dtype=np.int64)
-    return eval_binary_scores(p, y)
-
-
-def evaluate_probs(model, loader, device, max_batches=0, use_tta=False):
-    model.eval()
-    probs, labels = [], []
-    with torch.inference_mode():
-        for bi, (x, y) in enumerate(loader, start=1):
-            if use_tta:
-                p = predict_tta(model, x, device).cpu().numpy()
-            else:
-                x = x.to(device, non_blocking=True)
-                logits = model(pixel_values=x)
-                p = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-            probs.append(p)
-            labels.append(y.numpy())
-            if max_batches and bi >= max_batches:
-                break
-    return np.concatenate(probs), np.concatenate(labels)
-
-
-def time_latency(model, loader, device, warmup=20, iters=100, max_batches=0):
-    model.eval()
-
-    def _next(it, loader):
-        try:
-            return next(it)
-        except StopIteration:
-            return next(iter(loader))
-
-    # warmup
-    it = iter(loader)
-    for _ in range(warmup):
-        x, _ = _next(it, loader)
-        x = x.to(device)
-        _ = model(pixel_values=x)
-        if device == "cuda":
-            torch.cuda.synchronize()
-        if device == "mps":
-            torch.mps.synchronize()
-        if max_batches:
-            break
-    # timed
-    it = iter(loader)
-    nimg, steps = 0, 0
-    t0 = time.time()
-    while steps < iters:
-        x, _ = _next(it, loader)
-        x = x.to(device)
-        _ = model(pixel_values=x)
-        if device == "cuda":
-            torch.cuda.synchronize()
-        if device == "mps":
-            torch.mps.synchronize()
-        nimg += x.size(0)
-        steps += 1
-        if max_batches:
-            break
-    dt = time.time() - t0
-    # avoid div-by-zero
-    if steps == 0 or nimg == 0:
-        return float("nan"), float("nan")
-    return (dt / nimg) * 1000.0, nimg / dt
 
 
 def build_lr_log(opt, prefix: str, global_step: int):
