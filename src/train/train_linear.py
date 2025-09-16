@@ -188,9 +188,7 @@ class RandomRotate90:
         return img
 
 
-def main():
-    import wandb
-
+def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--method",
@@ -353,16 +351,21 @@ def main():
         "'sens95'/'acc' = maximize.",
     )
 
-    def _is_better(new, best, metric):
-        maximize = {"auroc", "sens95", "acc"}
-        minimize = {"val_loss", "nll", "brier", "ece"}
-        if metric in maximize:
-            return (best is None) or (new > best)
-        if metric in minimize:
-            return (best is None) or (new < best)
-        raise ValueError(f"Unknown select_metric: {metric}")
+    return ap.parse_args()
 
-    args = ap.parse_args()
+def _is_better(new, best, metric):
+    maximize = {"auroc", "sens95", "acc"}
+    minimize = {"val_loss", "nll", "brier", "ece"}
+    if metric in maximize:
+        return (best is None) or (new > best)
+    if metric in minimize:
+        return (best is None) or (new < best)
+    raise ValueError(f"Unknown select_metric: {metric}")
+
+def main():
+    import wandb
+
+    args = parse_args()
     EVAL_K = max(0, int(args.max_eval_batches))
 
     args.lr_head = args.lr if args.lr_head is None else args.lr_head
