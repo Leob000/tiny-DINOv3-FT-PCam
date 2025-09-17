@@ -128,6 +128,36 @@ def extract_training_metadata(
     return model_id, int(resolution)  # type:ignore
 
 
+def _apply_backbone_overrides(
+    module: nn.Module, overrides: Dict[str, torch.Tensor]
+) -> int:
+    if not overrides:
+        return 0
+    sd = module.state_dict()
+    matched = 0
+    missing = []
+    mismatched = []
+    for k, v in overrides.items():
+        if k in sd:
+            if sd[k].shape == v.shape:
+                sd[k] = v
+                matched += 1
+            else:
+                mismatched.append((k, tuple(sd[k].shape), tuple(v.shape)))
+        else:
+            missing.append(k)
+    module.load_state_dict(sd, strict=False)
+    if missing:
+        print(
+            f"[warn] backbone_overrides: {len(missing)} keys not found (first 5): {missing[:5]}"
+        )
+    if mismatched:
+        print(
+            f"[warn] backbone_overrides: {len(mismatched)} shape mismatches (first 3): {mismatched[:3]}"
+        )
+    return matched
+
+
 def load_model(
     checkpoint_path: str,
     ckpt_type: str,
@@ -147,11 +177,13 @@ def load_model(
         if state_dict is None:
             raise KeyError("Full checkpoint missing 'state_dict'.")
         model.load_state_dict(state_dict)  # type:ignore
+
     elif ckpt_type == "head_only":
         head_state = payload.get("head")
         if head_state is None:
             raise KeyError("Head-only checkpoint missing 'head'.")
         model.head.load_state_dict(head_state)  # type:ignore
+
     elif ckpt_type == "lora":
         adapters = payload.get("adapters")
         head_state = payload.get("head")
@@ -183,8 +215,28 @@ def load_model(
                 if b_key in adapters:  # type:ignore
                     module.B.data.copy_(adapters[b_key])  # type:ignore
         model.head.load_state_dict(head_state)  # type:ignore
-    else:  # type:ignore
+
+    else:
         raise ValueError(f"Unsupported checkpoint type: {ckpt_type}")
+
+    # warn if run trained norms/bias but no overrides are present
+    ck_args = payload.get("args", {}) if isinstance(payload, dict) else {}
+    tn_mode = (
+        ck_args.get("train_norms_bias", "none") if isinstance(ck_args, dict) else "none"
+    )
+    overrides = payload.get("backbone_overrides", {})
+
+    if tn_mode != "none" and not overrides:
+        print(
+            "[warn] This checkpoint trained backbone LayerNorms/bias "
+            f"('{tn_mode}') but contains no 'backbone_overrides'. "
+            "Metrics may be lower than at training time."
+        )
+
+    # apply overrides if present
+    if isinstance(overrides, dict) and overrides:
+        n_applied = _apply_backbone_overrides(model.backbone.model, overrides)  # type: ignore
+        print(f"Applied {n_applied} backbone override tensors (LayerNorm/bias).")
 
     model.eval()
     model.to(device)

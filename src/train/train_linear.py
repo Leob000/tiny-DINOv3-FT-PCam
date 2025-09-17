@@ -107,6 +107,12 @@ def save_checkpoint_full(path: str, model: nn.Module, args, extra=None):
 
 def save_checkpoint_head(path: str, model: nn.Module, args, extra=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    # grab LayerNorm/bias overrides if they were trained
+    backbone_overrides = collect_backbone_overrides(
+        model.backbone.model,  # type:ignore
+        args.train_norms_bias,
+    )
+
     payload = {
         "type": "head_only",
         "head": {k: v.detach().cpu() for k, v in model.head.state_dict().items()},  # type:ignore
@@ -115,14 +121,24 @@ def save_checkpoint_head(path: str, model: nn.Module, args, extra=None):
         "args": vars(args),
         "extra": extra or {},
     }
+    # only store if non-empty
+    if backbone_overrides:
+        payload["backbone_overrides"] = backbone_overrides
+        payload["train_norms_bias_mode"] = args.train_norms_bias
     torch.save(payload, path)
 
 
 def save_checkpoint_lora(path: str, model: nn.Module, args, extra=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    # grab LayerNorm/bias overrides if they were trained
+    backbone_overrides = collect_backbone_overrides(
+        model.backbone.model,  # type:ignore
+        args.train_norms_bias,
+    )
+
     payload = {
         "type": "lora",
-        "adapters": lora_adapter_state_dict(model),
+        "adapters": lora_adapter_state_dict(model),  # only A/B
         "head": {k: v.detach().cpu() for k, v in model.head.state_dict().items()},  # type:ignore
         "backbone_model_id": args.model_id,
         "image_size": args.resolution,
@@ -136,7 +152,39 @@ def save_checkpoint_lora(path: str, model: nn.Module, args, extra=None):
         "args": vars(args),
         "extra": extra or {},
     }
+    # only store if non-empty
+    if backbone_overrides:
+        payload["backbone_overrides"] = backbone_overrides
+        payload["train_norms_bias_mode"] = args.train_norms_bias
     torch.save(payload, path)
+
+
+def collect_backbone_overrides(
+    backbone_core: nn.Module, mode: str
+) -> Dict[str, torch.Tensor]:
+    """
+    Return a {param_name: tensor} dict for LayerNorm (weights/biases) and/or any *.bias
+    inside the backbone, matching what was enabled by `train_norms_bias`.
+    Tensors are detached to CPU so checkpoints stay lightweight.
+    """
+    if mode == "none":
+        return {}
+
+    overrides: Dict[str, torch.Tensor] = {}
+
+    if mode in ("norms", "both"):
+        for mod_name, mod in backbone_core.named_modules():
+            if isinstance(mod, nn.LayerNorm):
+                for p_name, p in mod.named_parameters(recurse=False):
+                    full = f"{mod_name}.{p_name}" if mod_name else p_name
+                    overrides[full] = p.detach().cpu().clone()
+
+    if mode in ("bias", "both"):
+        for name, p in backbone_core.named_parameters():
+            if name.endswith(".bias"):
+                overrides[name] = p.detach().cpu().clone()
+
+    return overrides
 
 
 def parse_args():
