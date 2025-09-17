@@ -13,7 +13,7 @@ SELECT_METRIC?=auroc
 WANDB?=--wandb
 NUM_WORKERS?=4
 EPOCHS?=8
-RESOLUTION?=96
+RESOLUTION?=224
 WARMUP_STEPS?=200
 GRAD_CLIP?=1.0
 LABEL_SMOOTHING?=0.05
@@ -34,6 +34,18 @@ VAL_FLAGS=--val_mid_epoch --val_epoch_end --val_heavy_end
 VAL_FLAGS_HUGE=--val_mid_epoch --val_epoch_end --val_heavy_end --val_heavy_mid
 VAL_FLAGS_NO_MID=--val_epoch_end --val_heavy_end
 TRAIN_NORMS_BIAS?=none # [none, norms, bias, both] train the LayerNorms params for head_only/LoRA methods
+
+CHECKPOINT?=checkpoints/saved/lora.pt
+
+eval:
+	$(PY) -m src.train.eval_checkpoint \
+		--checkpoint $(CHECKPOINT) \
+		--data_dir $(DATA_DIR) \
+		--model_id $(MODEL_ID) \
+		--resolution $(RESOLUTION) \
+		--val_batch_size $(VAL_BATCH_SIZE) \
+		--num_workers $(NUM_WORKERS) \
+		--tta_eval
 
 baseline:
 	$(PY) -m src.train.train_linear \

@@ -6,12 +6,8 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torchvision.transforms as T
-from PIL import Image
-from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.data.pcam_hf import PCamH5HF
 from src.models.backbone_dinov3 import DinoV3Backbone, DinoV3PCam
 from src.models.lora import LoRALinear, inject_lora
 from src.utils.eval_utils import (
@@ -19,32 +15,11 @@ from src.utils.eval_utils import (
     try_flops,
     get_device,
     evaluate,
+    evaluate_loss,
     time_latency,
 )
 from src.utils.seed import set_seed
-
-
-def evaluate_loss(model, loader, device, crit, max_batches=0):
-    """Fast eval: average cross-entropy loss on GPU. No concatenation/CPU metrics."""
-    model.eval()
-    total_loss, total_n = 0.0, 0
-    with torch.no_grad():
-        for bi, (x, y) in enumerate(loader, start=1):
-            time_batch_start = time.time()
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            logits = model(pixel_values=x)
-            loss = crit(logits, y)
-            bs = x.size(0)
-            total_loss += loss.item() * bs
-            total_n += bs
-            print(
-                f"Eval batch {bi} | time: {time.time() - time_batch_start:.3f}s",
-                end="\r",
-            )
-            if max_batches and bi >= max_batches:
-                break
-    return total_loss / max(1, total_n)
+from src.train.data_utils import build_eval_loaders, build_train_loader
 
 
 def build_lr_log(opt, prefix: str, global_step: int):
@@ -162,20 +137,6 @@ def save_checkpoint_lora(path: str, model: nn.Module, args, extra=None):
         "extra": extra or {},
     }
     torch.save(payload, path)
-
-
-class RandomRotate90:
-    """Rotate PIL image by k*90 degrees with k in {0,1,2,3}."""
-
-    def __call__(self, img: Image.Image) -> Image.Image:
-        k = torch.randint(0, 4, ()).item()
-        if k == 1:
-            return img.transpose(Image.ROTATE_90)  # type:ignore
-        if k == 2:
-            return img.transpose(Image.ROTATE_180)  # type:ignore
-        if k == 3:
-            return img.transpose(Image.ROTATE_270)  # type:ignore
-        return img
 
 
 def parse_args():
@@ -452,71 +413,22 @@ class LinearTrainer:
         self.wandb_run = run
 
     def _build_dataloaders(self):
-        def h5p(split, kind):
-            return os.path.join(
-                self.args.data_dir, f"camelyonpatch_level_2_split_{split}_{kind}.h5"
-            )
-
-        train_tf = None
-        if self.args.aug_histology:
-            train_tf = T.Compose(
-                [
-                    T.RandomHorizontalFlip(),
-                    T.RandomVerticalFlip(),
-                    RandomRotate90(),
-                    T.ColorJitter(
-                        brightness=0.1, contrast=0.1, saturation=0.1, hue=0.03
-                    ),
-                ]
-            )
-
-        train_ds = PCamH5HF(
-            h5p("train", "x"),
-            h5p("train", "y"),
+        train_loader = build_train_loader(
+            data_dir=self.args.data_dir,
             model_id=self.args.model_id,
             image_size=self.args.resolution,
-            transform=train_tf,
-        )
-        val_ds = PCamH5HF(
-            h5p("valid", "x"),
-            h5p("valid", "y"),
-            model_id=self.args.model_id,
-            image_size=self.args.resolution,
-            transform=None,
-        )
-        test_ds = PCamH5HF(
-            h5p("test", "x"),
-            h5p("test", "y"),
-            model_id=self.args.model_id,
-            image_size=self.args.resolution,
-            transform=None,
-        )
-
-        train_loader = DataLoader(
-            train_ds,
             batch_size=self.args.batch_size,
-            shuffle=True,
             num_workers=self.args.num_workers,
-            pin_memory=(self.device == "cuda"),
-            drop_last=True,
+            device=self.device,
+            aug_histology=self.args.aug_histology,
         )
-        val_loader = DataLoader(
-            val_ds,
+        val_loader, test_loader = build_eval_loaders(
+            data_dir=self.args.data_dir,
+            model_id=self.args.model_id,
+            image_size=self.args.resolution,
             batch_size=self.args.val_batch_size,
-            shuffle=False,
             num_workers=self.args.num_workers,
-            persistent_workers=True,
-            pin_memory=(self.device == "cuda"),
-            drop_last=False,
-        )
-        test_loader = DataLoader(
-            test_ds,
-            batch_size=self.args.val_batch_size,
-            shuffle=False,
-            num_workers=self.args.num_workers,
-            persistent_workers=True,
-            pin_memory=(self.device == "cuda"),
-            drop_last=False,
+            device=self.device,
         )
         return train_loader, val_loader, test_loader
 

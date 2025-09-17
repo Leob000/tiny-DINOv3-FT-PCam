@@ -108,6 +108,29 @@ def evaluate(
     return eval_binary_scores(p, y)
 
 
+def evaluate_loss(model, loader, device, crit, max_batches=0):
+    """Fast eval: average cross-entropy loss on GPU. No concatenation/CPU metrics."""
+    model.eval()
+    total_loss, total_n = 0.0, 0
+    with torch.no_grad():
+        for bi, (x, y) in enumerate(loader, start=1):
+            time_batch_start = time.time()
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            logits = model(pixel_values=x)
+            loss = crit(logits, y)
+            bs = x.size(0)
+            total_loss += loss.item() * bs
+            total_n += bs
+            print(
+                f"Eval batch {bi} | time: {time.time() - time_batch_start:.3f}s",
+                end="\r",
+            )
+            if max_batches and bi >= max_batches:
+                break
+    return total_loss / max(1, total_n)
+
+
 @torch.no_grad()
 def time_latency(
     model: nn.Module,
