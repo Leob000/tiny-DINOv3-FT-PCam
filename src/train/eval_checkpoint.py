@@ -1,6 +1,6 @@
 import argparse
 import os
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -76,6 +76,30 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Placeholder pruning amount in [0,1]; currently not implemented.",
+    )
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Enable Weights & Biases logging for this evaluation run.",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="dinov3-pcam-compress",
+        help="Weights & Biases project to log under.",
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="Optional W&B entity (team/user).",
+    )
+    parser.add_argument(
+        "--wandb_mode",
+        type=str,
+        default=None,
+        choices=[None, "online", "offline"],
+        help="Override WANDB_MODE environment variable.",
     )
     return parser.parse_args()
 
@@ -252,6 +276,54 @@ def maybe_apply_pruning(model: nn.Module, method: str, amount: float) -> None:
     )
 
 
+def init_wandb(
+    args: argparse.Namespace, metadata: Dict[str, object]
+) -> Tuple[Optional[Any], Optional[Any]]:
+    if not args.wandb:
+        return None, None
+
+    import wandb
+
+    if args.wandb_mode:
+        os.environ["WANDB_MODE"] = args.wandb_mode
+
+    tags = ["eval"]
+    ckpt_tag = metadata.get("ckpt_type")
+    if isinstance(ckpt_tag, str):
+        tags.append(f"ckpt:{ckpt_tag}")
+
+    config = {**vars(args), **metadata}
+    run = wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        job_type="eval",
+        config=config,
+        tags=tags,
+    )
+    wandb.define_metric("global_step")
+    wandb.define_metric("val/*", step_metric="global_step")
+    wandb.define_metric("test/*", step_metric="global_step")
+    return wandb, run
+
+
+def log_wandb_metrics(
+    wandb_module: Optional[Any],
+    wandb_run: Optional[Any],
+    log_payload: Dict[str, float],
+    summary_payload: Optional[Dict[str, float]] = None,
+) -> None:
+    if wandb_module is None:
+        return
+    wandb_module.log(log_payload)
+    if wandb_run is not None and summary_payload:
+        wandb_run.summary.update(summary_payload)
+
+
+def finalize_wandb(wandb_module: Optional[Any]) -> None:
+    if wandb_module is not None:
+        wandb_module.finish()
+
+
 def main() -> None:
     args = parse_args()
     checkpoint_path = resolve_checkpoint(args.checkpoint)
@@ -270,63 +342,95 @@ def main() -> None:
     print(f"Image size: {image_size}")
     print(f"Device: {device}")
 
-    val_loader, test_loader = build_eval_loaders(
-        data_dir=args.data_dir,
-        model_id=model_id,
-        image_size=image_size,
-        batch_size=args.val_batch_size,
-        num_workers=args.num_workers,
-        device=device,
-    )
+    wandb_metadata: Dict[str, object] = {
+        "checkpoint_path": checkpoint_path,
+        "ckpt_type": ckpt_type,
+        "resolved_model_id": model_id,
+        "resolved_image_size": image_size,
+        "device": device,
+    }
+    wandb_module, wandb_run = init_wandb(args, wandb_metadata)
 
-    model, _ = load_model(
-        checkpoint_path=checkpoint_path,
-        ckpt_type=ckpt_type,
-        model_id=model_id,
-        device=device,
-        payload=raw_payload,
-    )
+    try:
+        val_loader, test_loader = build_eval_loaders(
+            data_dir=args.data_dir,
+            model_id=model_id,
+            image_size=image_size,
+            batch_size=args.val_batch_size,
+            num_workers=args.num_workers,
+            device=device,
+        )
 
-    maybe_apply_pruning(model, args.prune_method, args.prune_amount)
+        model, _ = load_model(
+            checkpoint_path=checkpoint_path,
+            ckpt_type=ckpt_type,
+            model_id=model_id,
+            device=device,
+            payload=raw_payload,
+        )
 
-    criterion = nn.CrossEntropyLoss()
-    eval_limit = max(0, int(args.max_eval_batches))
+        maybe_apply_pruning(model, args.prune_method, args.prune_amount)
 
-    print("Running validation loss evaluation...")
-    val_loss = evaluate_loss(
-        model, val_loader, device, criterion, max_batches=eval_limit
-    )
-    print(f"Validation loss: {val_loss:.4f}")
+        criterion = nn.CrossEntropyLoss()
+        eval_limit = max(0, int(args.max_eval_batches))
 
-    print("Running test loss evaluation...")
-    test_loss = evaluate_loss(
-        model, test_loader, device, criterion, max_batches=eval_limit
-    )
-    print(f"Test loss: {test_loss:.4f}")
+        print("Running validation loss evaluation...")
+        val_loss = evaluate_loss(
+            model, val_loader, device, criterion, max_batches=eval_limit
+        )
+        print(f"Validation loss: {val_loss:.4f}")
 
-    print("Running full metric evaluation (validation)...")
-    val_metrics = evaluate(
-        model,
-        val_loader,
-        device,
-        max_batches=eval_limit,
-        use_tta=args.tta_eval,
-    )
-    print("Validation metrics:")
-    for key, value in val_metrics.items():
-        print(f"  {key}: {value:.4f}")
+        print("Running test loss evaluation...")
+        test_loss = evaluate_loss(
+            model, test_loader, device, criterion, max_batches=eval_limit
+        )
+        print(f"Test loss: {test_loss:.4f}")
 
-    print("Running full metric evaluation (test)...")
-    test_metrics = evaluate(
-        model,
-        test_loader,
-        device,
-        max_batches=eval_limit,
-        use_tta=args.tta_eval,
-    )
-    print("Test metrics:")
-    for key, value in test_metrics.items():
-        print(f"  {key}: {value:.4f}")
+        print("Running full metric evaluation (validation)...")
+        val_metrics = evaluate(
+            model,
+            val_loader,
+            device,
+            max_batches=eval_limit,
+            use_tta=args.tta_eval,
+        )
+        print("Validation metrics:")
+        for key, value in val_metrics.items():
+            print(f"  {key}: {value:.4f}")
+
+        print("Running full metric evaluation (test)...")
+        test_metrics = evaluate(
+            model,
+            test_loader,
+            device,
+            max_batches=eval_limit,
+            use_tta=args.tta_eval,
+        )
+        print("Test metrics:")
+        for key, value in test_metrics.items():
+            print(f"  {key}: {value:.4f}")
+
+        wandb_log: Dict[str, float] = {
+            "global_step": 0.0,
+            "val/loss": float(val_loss),
+            "test/loss": float(test_loss),
+        }
+        for key, value in val_metrics.items():
+            wandb_log[f"val/{key}"] = float(value)
+        for key, value in test_metrics.items():
+            wandb_log[f"test/{key}"] = float(value)
+
+        summary_payload = {k: v for k, v in wandb_log.items() if k != "global_step"}
+        summary_payload.update(
+            {
+                "val/max_eval_batches": float(eval_limit),
+                "test/max_eval_batches": float(eval_limit),
+                "eval/tta_enabled": float(args.tta_eval),
+            }
+        )
+        log_wandb_metrics(wandb_module, wandb_run, wandb_log, summary_payload)
+    finally:
+        finalize_wandb(wandb_module)
 
 
 if __name__ == "__main__":
