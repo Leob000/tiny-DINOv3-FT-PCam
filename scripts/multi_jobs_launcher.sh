@@ -1,7 +1,13 @@
-make sbaseline METHOD=head_only \
-  WARMUP_STEPS=400 \
-  TRAIN_NORMS_BIAS=both LR_HEAD=2.5e-4 LR_NORMS_BIAS=1e-4 \
-  RESOLUTION=224
+make seval CHECKPOINT=lora.pt
+
+make seval CHECKPOINT=fullft.pt
+
+make seval CHECKPOINT=head_only.pt
+
+# make sbaseline METHOD=head_only \
+#   WARMUP_STEPS=400 \
+#   TRAIN_NORMS_BIAS=both LR_HEAD=2.5e-4 LR_NORMS_BIAS=1e-4 \
+#   RESOLUTION=224
 
 # make sbaseline METHOD=lora \
 #   LORA_R=8 LORA_ALPHA=16 LORA_DROPOUT=0.1 \

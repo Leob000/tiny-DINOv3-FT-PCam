@@ -35,7 +35,7 @@ VAL_FLAGS_HUGE=--val_mid_epoch --val_epoch_end --val_heavy_end --val_heavy_mid
 VAL_FLAGS_NO_MID=--val_epoch_end --val_heavy_end
 TRAIN_NORMS_BIAS?=none # [none, norms, bias, both] train the LayerNorms params for head_only/LoRA methods
 
-CHECKPOINT?=checkpoints/saved/lora.pt
+CHECKPOINT?=lora.pt
 
 eval:
 	$(PY) -m src.train.eval_checkpoint \
@@ -131,7 +131,16 @@ COMMON = $(PY) -m src.train.train_linear \
 	--aug_histology --tta_eval \
   --save_best
 
-.PHONY: common
+COMMON2 = $(PY) -m src.train.eval_checkpoint \
+	--checkpoint $(CHECKPOINT) \
+	--data_dir $(DATA_DIR) \
+	--model_id $(MODEL_ID) \
+	--resolution $(RESOLUTION) \
+	--val_batch_size $(VAL_BATCH_SIZE) \
+	--num_workers $(NUM_WORKERS) \
+	--tta_eval
+
+.PHONY: common common2
 
 # Where the project & venv live on the cluster
 CLUSTER_DIR ?= $(HOME)/Tiny-DINOv3-PCam
@@ -150,3 +159,7 @@ endef
 sbaseline:
 	mkdir -p slurm
 	$(SBATCH) --wrap='$(call WRAP_CMD,$(COMMON))'
+
+seval:
+	mkdir -p slurm
+	$(SBATCH) --wrap='$(call WRAP_CMD,$(COMMON2))'
