@@ -133,6 +133,7 @@ COMMON = $(PY) -m src.train.train_linear \
 
 COMMON2 = $(PY) -m src.train.eval_checkpoint \
 	--checkpoint $(CHECKPOINT) \
+  $(WANDB) --wandb_project dinov3-pcam-compress \
 	--data_dir $(DATA_DIR) \
 	--model_id $(MODEL_ID) \
 	--resolution $(RESOLUTION) \
