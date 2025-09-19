@@ -56,6 +56,83 @@ def _count_parameters(module: nn.Module) -> int:
 
 
 @torch.no_grad()
+def _prune_mlp_neurons(
+    module: nn.Module, energy_threshold: float
+) -> Tuple[int, int, int, List[Tuple[str, int, int]]]:
+    changed = 0
+    orig = 0
+    new = 0
+    details: List[Tuple[str, int, int]] = []
+    for name, parent in module.named_modules():
+        if not (hasattr(parent, "up_proj") and hasattr(parent, "down_proj")):
+            continue
+        up, down = parent.up_proj, parent.down_proj
+        if not (isinstance(up, nn.Linear) and isinstance(down, nn.Linear)):
+            continue
+        if up.out_features != down.in_features:
+            continue
+
+        Wup = up.weight.detach()  # (r, d)
+        Wdown = down.weight.detach()  # (d, r)
+        r = up.out_features
+        if r <= 1:
+            continue
+
+        up_norm = torch.linalg.norm(Wup, dim=1)  # (r,)
+        down_norm = torch.linalg.norm(Wdown, dim=0)  # (r,)
+        scores = up_norm * down_norm
+        energy = scores**2
+        keep_order = torch.argsort(scores, descending=True)
+        cum = torch.cumsum(energy[keep_order], dim=0) / torch.sum(energy)
+        keep_r = (
+            int(
+                torch.searchsorted(
+                    cum, min(max(float(energy_threshold), 1e-6), 1.0)
+                ).item()
+            )
+            + 1
+        )
+        keep_r = max(1, min(keep_r, r))
+        if keep_r >= r:
+            continue
+
+        idx = torch.sort(keep_order[:keep_r]).values
+        # Build new layers
+        new_up = nn.Linear(up.in_features, keep_r, bias=(up.bias is not None))
+        new_up.weight.copy_(Wup[idx, :])
+        if up.bias is not None:
+            new_up.bias.copy_(up.bias.detach()[idx])
+
+        new_down = nn.Linear(keep_r, down.out_features, bias=(down.bias is not None))
+        new_down.weight.copy_(Wdown[:, idx])
+        if down.bias is not None:
+            new_down.bias.copy_(down.bias.detach())
+
+        # preserve dtype/device
+        dev, dt = up.weight.device, up.weight.dtype
+        parent.up_proj = new_up.to(device=dev, dtype=dt)
+        parent.down_proj = new_down.to(device=dev, dtype=dt)
+
+        changed += 1
+        o = (
+            Wup.numel()
+            + Wdown.numel()
+            + (up.bias.numel() if up.bias is not None else 0)
+            + (down.bias.numel() if down.bias is not None else 0)
+        )
+        n = (
+            new_up.weight.numel()
+            + new_down.weight.numel()
+            + (new_up.bias.numel() if new_up.bias is not None else 0)
+            + (new_down.bias.numel() if new_down.bias is not None else 0)
+        )
+        orig += o
+        new += n
+        details.append((name, r, keep_r))
+    return changed, orig, new, details
+
+
+@torch.no_grad()
 def merge_lora_adapters(module: nn.Module) -> int:
     to_replace: List[Tuple[str, LoRALinear]] = []
     for name, submodule in module.named_modules():
@@ -216,7 +293,7 @@ def parse_args() -> argparse.Namespace:
         "--prune_method",
         type=str,
         default="none",
-        help="Pruning method to apply (supported: none, truncated_svd).",
+        help="Pruning method to apply (supported: none, truncated_svd, mlp_neurons).",
     )
     parser.add_argument(
         "--prune_amount",
@@ -234,7 +311,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Comma-separated substrings for linear layer names to compress. Known "
             "options: q_proj,k_proj,v_proj,o_proj,up_proj,down_proj. Use 'all' or '*' to "
-            "select all known targets."
+            "select all known targets. Only used with truncated SVD pruning."
         ),
     )
     parser.add_argument(
@@ -435,39 +512,61 @@ def load_model(
 def apply_pruning(
     model: nn.Module, method: str, energy_threshold: float, target_spec: str
 ) -> None:
-    method = method.lower()
+    method = method.strip().lower()
     if method in {"none", ""}:
         return
 
-    if method not in {"truncated_svd", "svd", "tsvd"}:
-        raise ValueError(f"Unsupported pruning method '{method}'.")
-
-    if not (0.0 < float(energy_threshold) <= 1.0):
+    threshold = float(energy_threshold)
+    if not (0.0 < threshold <= 1.0):
         raise ValueError("Energy threshold must be in (0, 1].")
 
-    targets = _parse_prune_targets(target_spec)
-    if not targets:
-        print("[warn] No prune targets resolved; skipping pruning.")
-        return
+    if method in {"truncated_svd", "svd", "tsvd"}:
+        targets = _parse_prune_targets(target_spec)
+        if not targets:
+            print("[warn] No prune targets resolved; skipping pruning.")
+            return
 
-    replaced, original_params, compressed_params, details = (
-        _apply_truncated_svd_to_model(model, targets, float(energy_threshold))
-    )
-
-    if replaced == 0:
-        print(
-            "[info] Truncated SVD did not modify any layers (check target substrings or threshold)."
+        replaced, original_params, compressed_params, details = _apply_truncated_svd_to_model(
+            model, targets, threshold
         )
+
+        if replaced == 0:
+            print(
+                "[info] Truncated SVD did not modify any layers (check target substrings or threshold)."
+            )
+            return
+
+        reduction = 1.0 - (compressed_params / max(1, original_params))
+        print(
+            f"Applied truncated SVD to {replaced} layers; params {original_params} → {compressed_params} ({reduction:.1%} reduction)."
+        )
+        for name, in_feats, out_feats, rank in details[:5]:
+            print(f"  - {name}: ({out_feats}×{in_feats}) → rank {rank} factorization")
+        if len(details) > 5:
+            print(f"    … {len(details) - 5} additional layers compressed")
         return
 
-    reduction = 1.0 - (compressed_params / max(1, original_params))
-    print(
-        f"Applied truncated SVD to {replaced} layers; params {original_params} → {compressed_params} ({reduction:.1%} reduction)."
-    )
-    for name, in_feats, out_feats, rank in details[:5]:
-        print(f"  - {name}: ({out_feats}×{in_feats}) → rank {rank} factorization")
-    if len(details) > 5:
-        print(f"    … {len(details) - 5} additional layers compressed")
+    if method in {"mlp", "mlp_neurons", "mlp-prune", "mlp-neurons"}:
+        changed, original_params, compressed_params, details = _prune_mlp_neurons(
+            model, threshold
+        )
+        if changed == 0:
+            print(
+                "[info] MLP neuron pruning did not modify any layers (try lowering the threshold)."
+            )
+            return
+
+        reduction = 1.0 - (compressed_params / max(1, original_params))
+        print(
+            f"Applied MLP neuron pruning to {changed} blocks; params {original_params} → {compressed_params} ({reduction:.1%} reduction)."
+        )
+        for name, prev_width, kept_width in details[:5]:
+            print(f"  - {name}: width {prev_width} → {kept_width}")
+        if len(details) > 5:
+            print(f"    … {len(details) - 5} additional MLP blocks pruned")
+        return
+
+    raise ValueError(f"Unsupported pruning method '{method}'.")
 
 
 def init_wandb(

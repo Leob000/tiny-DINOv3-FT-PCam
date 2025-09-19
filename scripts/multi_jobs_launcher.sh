@@ -1,38 +1,38 @@
 make seval CHECKPOINT=lora.pt \
-  WANDB_RUN_NAME=eval_lora_tsvd0.99 \
-  PRUNE_AMOUNT=0.99 PRUNE_TARGETS=all
+  WANDB_RUN_NAME=eval_lora_tsvd0.96 \
+  PRUNE_AMOUNT=0.96 PRUNE_TARGETS=all PRUNE_METHOD=truncated_svd
 
 make seval CHECKPOINT=fullft.pt \
-  WANDB_RUN_NAME=eval_fullft_tsvd0.99 \
-  PRUNE_AMOUNT=0.99 PRUNE_TARGETS=all
+  WANDB_RUN_NAME=eval_fullft_tsvd0.96 \
+  PRUNE_AMOUNT=0.96 PRUNE_TARGETS=all PRUNE_METHOD=truncated_svd
 
 make seval CHECKPOINT=head_only.pt \
-  WANDB_RUN_NAME=eval_head_tsvd0.99 \
-  PRUNE_AMOUNT=0.99 PRUNE_TARGETS=all
+  WANDB_RUN_NAME=eval_head_tsvd0.96 \
+  PRUNE_AMOUNT=0.96 PRUNE_TARGETS=all PRUNE_METHOD=truncated_svd
+
+make seval CHECKPOINT=lora.pt \
+  WANDB_RUN_NAME=eval_lora_tsvd0.96 \
+  PRUNE_AMOUNT=0.96 PRUNE_TARGETS=all PRUNE_METHOD=mlp_neurons
+
+make seval CHECKPOINT=fullft.pt \
+  WANDB_RUN_NAME=eval_fullft_tsvd0.96 \
+  PRUNE_AMOUNT=0.96 PRUNE_TARGETS=all PRUNE_METHOD=mlp_neurons
+
+make seval CHECKPOINT=head_only.pt \
+  WANDB_RUN_NAME=eval_head_tsvd0.96 \
+  PRUNE_AMOUNT=0.96 PRUNE_TARGETS=al PRUNE_METHOD=mlp_neuronsl
 
 make seval CHECKPOINT=lora.pt \
   WANDB_RUN_NAME=eval_lora_tsvd0.98 \
-  PRUNE_AMOUNT=0.98 PRUNE_TARGETS=all
+  PRUNE_AMOUNT=0.98 PRUNE_TARGETS=all PRUNE_METHOD=mlp_neurons
 
 make seval CHECKPOINT=fullft.pt \
   WANDB_RUN_NAME=eval_fullft_tsvd0.98 \
-  PRUNE_AMOUNT=0.98 PRUNE_TARGETS=all
+  PRUNE_AMOUNT=0.98 PRUNE_TARGETS=all PRUNE_METHOD=mlp_neurons
 
 make seval CHECKPOINT=head_only.pt \
   WANDB_RUN_NAME=eval_head_tsvd0.98 \
-  PRUNE_AMOUNT=0.98 PRUNE_TARGETS=all
-
-make seval CHECKPOINT=lora.pt \
-  WANDB_RUN_NAME=eval_lora_tsvd0.97 \
-  PRUNE_AMOUNT=0.97 PRUNE_TARGETS=all
-
-make seval CHECKPOINT=fullft.pt \
-  WANDB_RUN_NAME=eval_fullft_tsvd0.97 \
-  PRUNE_AMOUNT=0.97 PRUNE_TARGETS=all
-
-make seval CHECKPOINT=head_only.pt \
-  WANDB_RUN_NAME=eval_head_tsvd0.97 \
-  PRUNE_AMOUNT=0.97 PRUNE_TARGETS=all
+  PRUNE_AMOUNT=0.98 PRUNE_TARGETS=al PRUNE_METHOD=mlp_neuronsl
 
 # make sbaseline METHOD=head_only \
 #   WARMUP_STEPS=400 \
