@@ -1,8 +1,11 @@
-make seval CHECKPOINT=lora.pt
+make seval CHECKPOINT=lora.pt \
+  PRUNE_AMOUNT=0.75 PRUNE_TARGETS=all
 
-make seval CHECKPOINT=fullft.pt
+make seval CHECKPOINT=fullft.pt \
+  PRUNE_AMOUNT=0.75 PRUNE_TARGETS=all
 
-make seval CHECKPOINT=head_only.pt
+make seval CHECKPOINT=head_only.pt \
+  PRUNE_AMOUNT=0.75 PRUNE_TARGETS=all
 
 # make sbaseline METHOD=head_only \
 #   WARMUP_STEPS=400 \

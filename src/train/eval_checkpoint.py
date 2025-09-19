@@ -1,6 +1,6 @@
 import argparse
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -12,6 +12,145 @@ from src.utils.eval_utils import evaluate, get_device, evaluate_loss
 DEFAULT_MODEL_ID = "facebook/dinov3-vits16-pretrain-lvd1689m"
 DEFAULT_IMAGE_SIZE = 224
 CHECKPOINT_ROOT = "checkpoints/saved"
+
+KNOWN_SVD_TARGETS = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "up_proj",
+    "down_proj",
+]
+
+
+def _parse_prune_targets(raw: str) -> List[str]:
+    tokens = [t.strip() for t in raw.split(",") if t.strip()]
+    if not tokens:
+        return []
+    lowered = [t.lower() for t in tokens]
+    if any(t in {"all", "*"} for t in lowered):
+        return list(KNOWN_SVD_TARGETS)
+
+    unknown = sorted({t for t in tokens if t not in KNOWN_SVD_TARGETS})
+    if unknown:
+        joined = ", ".join(unknown)
+        print(
+            f"[warn] Unrecognized prune targets requested ({joined}); they will be used as substring filters."
+        )
+    return tokens
+
+
+def _resolve_parent_module(
+    root: nn.Module, qualified_name: str
+) -> Tuple[nn.Module, str]:
+    parts = qualified_name.split(".")
+    parent = root
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+    return parent, parts[-1]
+
+
+@torch.no_grad()
+def _merge_lora_adapters(module: nn.Module) -> int:
+    to_replace: List[Tuple[str, LoRALinear]] = []
+    for name, submodule in module.named_modules():
+        if isinstance(submodule, LoRALinear):
+            submodule.merge()
+            to_replace.append((name, submodule))
+
+    for name, lora_mod in to_replace:
+        parent, leaf = _resolve_parent_module(module, name)
+        setattr(parent, leaf, lora_mod.base)
+    if to_replace:
+        print(f"Merged {len(to_replace)} LoRA adapters into their base linear layers.")
+    return len(to_replace)
+
+
+@torch.no_grad()
+def _truncated_svd_linear(
+    linear: nn.Linear, energy_threshold: float
+) -> Optional[Tuple[nn.Module, int, int, int]]:
+    weight = linear.weight.detach()
+    out_features, in_features = weight.shape
+    min_dim = min(out_features, in_features)
+    if min_dim == 0:
+        return None
+
+    svd_dtype = torch.float32
+    weight_cpu = weight.to(dtype=svd_dtype, device="cpu")
+    try:
+        U, S, Vh = torch.linalg.svd(weight_cpu, full_matrices=False)
+    except RuntimeError as exc:  # pragma: no cover - protective guard
+        print(f"[warn] SVD failed for layer ({exc}); skipping compression.")
+        return None
+
+    squared = S**2
+    total_energy = torch.sum(squared)
+    if total_energy.item() == 0:
+        return None
+
+    cumulative = torch.cumsum(squared, dim=0) / total_energy
+    clamped = min(max(float(energy_threshold), 1e-6), 1.0)
+    keep_rank = int(torch.searchsorted(cumulative, clamped).item()) + 1
+    keep_rank = max(1, min(keep_rank, min_dim))
+    if keep_rank >= min_dim:
+        return None
+
+    first = nn.Linear(in_features, keep_rank, bias=False)
+    second = nn.Linear(keep_rank, out_features, bias=linear.bias is not None)
+
+    first.weight.copy_(Vh[:keep_rank, :])
+    second.weight.copy_(U[:, :keep_rank] * S[:keep_rank])
+    if linear.bias is not None:
+        second.bias.copy_(linear.bias.detach())
+
+    device = linear.weight.device
+    dtype = linear.weight.dtype
+    first = first.to(device=device, dtype=dtype)
+    second = second.to(device=device, dtype=dtype)
+    for param in first.parameters():
+        param.requires_grad = False
+    for param in second.parameters():
+        param.requires_grad = False
+
+    new_module = nn.Sequential(first, second)
+    original_params = weight.numel() + (
+        linear.bias.numel() if linear.bias is not None else 0
+    )
+    new_params = sum(p.numel() for p in new_module.parameters())
+    return new_module, keep_rank, original_params, new_params
+
+
+@torch.no_grad()
+def _apply_truncated_svd_to_model(
+    module: nn.Module, target_keys: List[str], energy_threshold: float
+) -> Tuple[int, int, int, List[Tuple[str, int, int, int]]]:
+    if not target_keys:
+        return 0, 0, 0, []
+
+    candidates: List[Tuple[str, nn.Linear]] = []
+    for name, submodule in module.named_modules():
+        if not name:
+            continue
+        if isinstance(submodule, nn.Linear) and any(key in name for key in target_keys):
+            candidates.append((name, submodule))
+
+    replaced: List[Tuple[str, int, int, int]] = []
+    original_params = 0
+    compressed_params = 0
+
+    for name, linear in candidates:
+        result = _truncated_svd_linear(linear, energy_threshold)
+        if result is None:
+            continue
+        new_module, rank, old_params, new_params = result
+        parent, leaf = _resolve_parent_module(module, name)
+        setattr(parent, leaf, new_module)
+        replaced.append((name, linear.in_features, linear.out_features, rank))
+        original_params += old_params
+        compressed_params += new_params
+
+    return len(replaced), original_params, compressed_params, replaced
 
 
 def parse_args() -> argparse.Namespace:
@@ -69,13 +208,26 @@ def parse_args() -> argparse.Namespace:
         "--prune_method",
         type=str,
         default="none",
-        help="Placeholder pruning method name; currently not implemented.",
+        help="Pruning method to apply (supported: none, truncated_svd).",
     )
     parser.add_argument(
         "--prune_amount",
         type=float,
-        default=0.0,
-        help="Placeholder pruning amount in [0,1]; currently not implemented.",
+        default=0.95,
+        help=(
+            "Energy threshold for truncated SVD (keep this fraction of squared singular "
+            "values)."
+        ),
+    )
+    parser.add_argument(
+        "--prune_targets",
+        type=str,
+        default=",".join(KNOWN_SVD_TARGETS),
+        help=(
+            "Comma-separated substrings for linear layer names to compress. Known "
+            "options: q_proj,k_proj,v_proj,o_proj,up_proj,down_proj. Use 'all' or '*' to "
+            "select all known targets."
+        ),
     )
     parser.add_argument(
         "--wandb",
@@ -267,13 +419,43 @@ def load_model(
     return model, payload
 
 
-def maybe_apply_pruning(model: nn.Module, method: str, amount: float) -> None:
+def apply_pruning(
+    model: nn.Module, method: str, energy_threshold: float, target_spec: str
+) -> None:
     method = method.lower()
     if method in {"none", ""}:
         return
-    print(
-        f"[placeholder] Requested pruning method '{method}' with amount {amount}. No pruning applied."
+
+    if method not in {"truncated_svd", "svd", "tsvd"}:
+        raise ValueError(f"Unsupported pruning method '{method}'.")
+
+    if not (0.0 < float(energy_threshold) <= 1.0):
+        raise ValueError("Energy threshold must be in (0, 1].")
+
+    targets = _parse_prune_targets(target_spec)
+    if not targets:
+        print("[warn] No prune targets resolved; skipping pruning.")
+        return
+
+    _merge_lora_adapters(model)
+    replaced, original_params, compressed_params, details = (
+        _apply_truncated_svd_to_model(model, targets, float(energy_threshold))
     )
+
+    if replaced == 0:
+        print(
+            "[info] Truncated SVD did not modify any layers (check target substrings or threshold)."
+        )
+        return
+
+    reduction = 1.0 - (compressed_params / max(1, original_params))
+    print(
+        f"Applied truncated SVD to {replaced} layers; params {original_params} → {compressed_params} ({reduction:.1%} reduction)."
+    )
+    for name, in_feats, out_feats, rank in details[:5]:
+        print(f"  - {name}: ({out_feats}×{in_feats}) → rank {rank} factorization")
+    if len(details) > 5:
+        print(f"    … {len(details) - 5} additional layers compressed")
 
 
 def init_wandb(
@@ -348,6 +530,9 @@ def main() -> None:
         "resolved_model_id": model_id,
         "resolved_image_size": image_size,
         "device": device,
+        "prune_method": args.prune_method,
+        "prune_amount": args.prune_amount,
+        "prune_targets": args.prune_targets,
     }
     wandb_module, wandb_run = init_wandb(args, wandb_metadata)
 
@@ -369,7 +554,12 @@ def main() -> None:
             payload=raw_payload,
         )
 
-        maybe_apply_pruning(model, args.prune_method, args.prune_amount)
+        apply_pruning(
+            model,
+            args.prune_method,
+            args.prune_amount,
+            args.prune_targets,
+        )
 
         criterion = nn.CrossEntropyLoss()
         eval_limit = max(0, int(args.max_eval_batches))

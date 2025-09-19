@@ -36,6 +36,9 @@ VAL_FLAGS_NO_MID=--val_epoch_end --val_heavy_end
 TRAIN_NORMS_BIAS?=none # [none, norms, bias, both] train the LayerNorms params for head_only/LoRA methods
 
 CHECKPOINT?=lora.pt
+PRUNE_METHOD?=truncated_svd
+PRUNE_AMOUNT?=1.0
+PRUNE_TARGETS?=all
 
 eval:
 	$(PY) -m src.train.eval_checkpoint \
@@ -139,6 +142,7 @@ COMMON2 = $(PY) -m src.train.eval_checkpoint \
 	--resolution $(RESOLUTION) \
 	--val_batch_size $(VAL_BATCH_SIZE) \
 	--num_workers $(NUM_WORKERS) \
+	--prune_method $(PRUNE_METHOD) --prune_amount $(PRUNE_AMOUNT) --prune_targets $(PRUNE_TARGETS) \
 	--tta_eval
 
 .PHONY: common common2
