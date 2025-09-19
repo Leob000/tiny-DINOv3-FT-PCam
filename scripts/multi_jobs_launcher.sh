@@ -1,24 +1,24 @@
-make seval CHECKPOINT=head_only.pt \
-  WANDB_RUN_NAME=eval_head_mlp0.96 \
-  PRUNE_AMOUNT=0.96 PRUNE_TARGETS=all PRUNE_METHOD=mlp_neurons
-
-make seval CHECKPOINT=head_only.pt \
-  WANDB_RUN_NAME=eval_head_mlp0.98 \
-  PRUNE_AMOUNT=0.98 PRUNE_TARGETS=all PRUNE_METHOD=mlp_neurons
-
-###
-
-make seval CHECKPOINT=lora.pt \
-  WANDB_RUN_NAME=eval_lora_qk0.96 \
-  PRUNE_AMOUNT=0.96 PRUNE_TARGETS=all PRUNE_METHOD=qk_product
+make seval CHECKPOINT=fullft.pt \
+  WANDB_RUN_NAME=eval_fullft_qk0.95 \
+  PRUNE_AMOUNT=0.95 PRUNE_TARGETS=all PRUNE_METHOD=qk_product
 
 make seval CHECKPOINT=fullft.pt \
-  WANDB_RUN_NAME=eval_fullft_qk0.96 \
-  PRUNE_AMOUNT=0.96 PRUNE_TARGETS=all PRUNE_METHOD=qk_product
+  WANDB_RUN_NAME=eval_fullft_qk0.94 \
+  PRUNE_AMOUNT=0.94 PRUNE_TARGETS=all PRUNE_METHOD=qk_product
 
-make seval CHECKPOINT=head_only.pt \
-  WANDB_RUN_NAME=eval_head_qk0.96 \
-  PRUNE_AMOUNT=0.96 PRUNE_TARGETS=al PRUNE_METHOD=qk_product
+make seval CHECKPOINT=fullft.pt \
+  WANDB_RUN_NAME=eval_fullft_qk0.93 \
+  PRUNE_AMOUNT=0.93 PRUNE_TARGETS=all PRUNE_METHOD=qk_product
+
+# make seval CHECKPOINT=lora.pt \
+#   WANDB_RUN_NAME=eval_lora_qk0.96 \
+#   PRUNE_AMOUNT=0.96 PRUNE_TARGETS=all PRUNE_METHOD=qk_product
+#
+# make seval CHECKPOINT=head_only.pt \
+#   WANDB_RUN_NAME=eval_head_qk0.96 \
+#   PRUNE_AMOUNT=0.96 PRUNE_TARGETS=al PRUNE_METHOD=qk_product
+
+###
 
 # make sbaseline METHOD=head_only \
 #   WARMUP_STEPS=400 \

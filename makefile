@@ -36,8 +36,8 @@ VAL_FLAGS_NO_MID=--val_epoch_end --val_heavy_end
 TRAIN_NORMS_BIAS?=none # [none, norms, bias, both] train the LayerNorms params for head_only/LoRA methods
 
 CHECKPOINT?=lora.pt
-PRUNE_METHOD?=truncated_svd
-PRUNE_AMOUNT?=1.0
+PRUNE_METHOD?=qk_product
+PRUNE_AMOUNT?=0.95
 PRUNE_TARGETS?=all
 WANDB_RUN_NAME?=eval_run
 
@@ -49,6 +49,7 @@ eval:
 		--resolution $(RESOLUTION) \
 		--val_batch_size $(VAL_BATCH_SIZE) \
 		--num_workers $(NUM_WORKERS) \
+	--prune_method $(PRUNE_METHOD) --prune_amount $(PRUNE_AMOUNT) --prune_targets $(PRUNE_TARGETS) \
 		--tta_eval
 
 baseline:

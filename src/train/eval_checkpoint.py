@@ -207,12 +207,16 @@ def _svd_qk_product_per_head(
     for h, (s, e) in enumerate(head_slices):
         Wq_h = Wq[:, s:e]  # (d_in, d_h)
         Wk_h = Wk[:, s:e]  # (d_in, d_h)
-        bq_h = bq[s:e] if bq is not None else torch.zeros(d_h, dtype=Wq_h.dtype)
+        bq_h = (
+            bq[s:e]
+            if bq is not None
+            else torch.zeros(d_h, dtype=Wq_h.dtype, device=Wq_h.device)
+        )
 
         # Augment to include bias exactly: [W; b^T]
         Wq_aug = torch.vstack([Wq_h, bq_h.unsqueeze(0)])  # (d_in+1, d_h)
         Wk_aug = torch.vstack(
-            [Wk_h, torch.zeros(1, d_h, dtype=Wk_h.dtype)]
+            [Wk_h, torch.zeros(1, d_h, dtype=Wk_h.dtype, device=Wk_h.device)]
         )  # (d_in+1, d_h)
 
         # Product in augmented space
@@ -276,7 +280,7 @@ def _svd_qk_product_per_head(
         # Not worth replacing for this block
         return None
 
-    # --- Build new q_proj, k_proj as Sequentials with block-diagonal second stage ---
+    # Build new q_proj, k_proj as Sequentials
     # First stage weights/biases (stack all heads one under another)
     W1_q = torch.zeros((r_total, d_in), dtype=dtype, device=device)
     b1_q = torch.zeros((r_total,), dtype=dtype, device=device)
@@ -337,7 +341,7 @@ def _svd_qk_product_per_head(
     k1.bias.copy_(b1_k)
     k2.weight.copy_(W2_k)
 
-    # Freeze by default (to match your SVD behavior); flip to True if you want post-FT recovery
+    # Freeze by default (to match SVD behavior); flip to True if want post-FT recovery
     for p in q1.parameters():
         p.requires_grad = False
     for p in q2.parameters():
@@ -347,11 +351,9 @@ def _svd_qk_product_per_head(
     for p in k2.parameters():
         p.requires_grad = False
 
-    # Install
     parent.q_proj = nn.Sequential(q1, q2).to(device=device, dtype=dtype)  # type: ignore
     parent.k_proj = nn.Sequential(k1, k2).to(device=device, dtype=dtype)  # type: ignore
 
-    # Summaries
     details: List[Tuple[str, int, int, int]] = []
     for h, r in enumerate(r_list):
         details.append((f"head_{h}", d_in, d_h, r))
