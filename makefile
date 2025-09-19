@@ -39,6 +39,7 @@ CHECKPOINT?=lora.pt
 PRUNE_METHOD?=truncated_svd
 PRUNE_AMOUNT?=1.0
 PRUNE_TARGETS?=all
+WANDB_RUN_NAME?=eval_run
 
 eval:
 	$(PY) -m src.train.eval_checkpoint \
@@ -137,6 +138,7 @@ COMMON = $(PY) -m src.train.train_linear \
 COMMON2 = $(PY) -m src.train.eval_checkpoint \
 	--checkpoint $(CHECKPOINT) \
   $(WANDB) --wandb_project dinov3-pcam-compress \
+	--wandb_run_name $(WANDB_RUN_NAME) \
 	--data_dir $(DATA_DIR) \
 	--model_id $(MODEL_ID) \
 	--resolution $(RESOLUTION) \

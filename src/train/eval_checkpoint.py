@@ -253,6 +253,11 @@ def parse_args() -> argparse.Namespace:
         choices=[None, "online", "offline"],
         help="Override WANDB_MODE environment variable.",
     )
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default="eval_run",
+    )
     return parser.parse_args()
 
 
@@ -478,6 +483,7 @@ def init_wandb(
     run = wandb.init(
         project=args.wandb_project,
         entity=args.wandb_entity,
+        name=args.wandb_run_name,
         job_type="eval",
         config=config,
         tags=tags,
