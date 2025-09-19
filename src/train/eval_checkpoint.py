@@ -50,6 +50,11 @@ def _resolve_parent_module(
     return parent, parts[-1]
 
 
+def _count_parameters(module: nn.Module) -> int:
+    """Return the total number of parameters in a module."""
+    return sum(param.numel() for param in module.parameters())
+
+
 @torch.no_grad()
 def _merge_lora_adapters(module: nn.Module) -> int:
     to_replace: List[Tuple[str, LoRALinear]] = []
@@ -560,12 +565,20 @@ def main() -> None:
             payload=raw_payload,
         )
 
+        params_before = _count_parameters(model)
+        print(f"Model parameters before pruning: {params_before:,}")
+
         apply_pruning(
             model,
             args.prune_method,
             args.prune_amount,
             args.prune_targets,
         )
+
+        params_after = _count_parameters(model)
+        params_diff = params_before - params_after
+        print(f"Model parameters after pruning: {params_after:,}")
+        print(f"Parameter difference (before - after): {params_diff:+,}")
 
         criterion = nn.CrossEntropyLoss()
         eval_limit = max(0, int(args.max_eval_batches))
@@ -615,6 +628,16 @@ def main() -> None:
             wandb_log[f"val/{key}"] = float(value)
         for key, value in test_metrics.items():
             wandb_log[f"test/{key}"] = float(value)
+
+        wandb_log.update(
+            {
+                "model/params_before": float(params_before),
+                "model/params_after": float(params_after),
+                "model/params_diff": float(params_diff),
+                "model/params_pct_reduction": (params_before - params_after)
+                / max(1, params_before),
+            }
+        )
 
         summary_payload = {k: v for k, v in wandb_log.items() if k != "global_step"}
         summary_payload.update(
