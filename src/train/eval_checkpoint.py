@@ -97,21 +97,33 @@ def _prune_mlp_neurons(
             continue
 
         idx = torch.sort(keep_order[:keep_r]).values
-        # Build new layers
-        new_up = nn.Linear(up.in_features, keep_r, bias=(up.bias is not None))
+        dev, dt = up.weight.device, up.weight.dtype
+
+        # Build new layers on the same device/dtype as the originals before copying
+        new_up = nn.Linear(up.in_features, keep_r, bias=(up.bias is not None)).to(
+            device=dev, dtype=dt
+        )
         new_up.weight.copy_(Wup[idx, :])
         if up.bias is not None:
             new_up.bias.copy_(up.bias.detach()[idx])
 
-        new_down = nn.Linear(keep_r, down.out_features, bias=(down.bias is not None))
+        new_down = nn.Linear(
+            keep_r, down.out_features, bias=(down.bias is not None)
+        ).to(device=dev, dtype=dt)
         new_down.weight.copy_(Wdown[:, idx])
         if down.bias is not None:
             new_down.bias.copy_(down.bias.detach())
 
-        # preserve dtype/device
-        dev, dt = up.weight.device, up.weight.dtype
-        parent.up_proj = new_up.to(device=dev, dtype=dt)
-        parent.down_proj = new_down.to(device=dev, dtype=dt)
+        # Match the original gradient settings
+        new_up.weight.requires_grad = up.weight.requires_grad
+        if new_up.bias is not None and up.bias is not None:
+            new_up.bias.requires_grad = up.bias.requires_grad
+        new_down.weight.requires_grad = down.weight.requires_grad
+        if new_down.bias is not None and down.bias is not None:
+            new_down.bias.requires_grad = down.bias.requires_grad
+
+        parent.up_proj = new_up
+        parent.down_proj = new_down
 
         changed += 1
         o = (
@@ -526,8 +538,8 @@ def apply_pruning(
             print("[warn] No prune targets resolved; skipping pruning.")
             return
 
-        replaced, original_params, compressed_params, details = _apply_truncated_svd_to_model(
-            model, targets, threshold
+        replaced, original_params, compressed_params, details = (
+            _apply_truncated_svd_to_model(model, targets, threshold)
         )
 
         if replaced == 0:
