@@ -56,7 +56,7 @@ def _count_parameters(module: nn.Module) -> int:
 
 
 @torch.no_grad()
-def _merge_lora_adapters(module: nn.Module) -> int:
+def merge_lora_adapters(module: nn.Module) -> int:
     to_replace: List[Tuple[str, LoRALinear]] = []
     for name, submodule in module.named_modules():
         if isinstance(submodule, LoRALinear):
@@ -450,7 +450,6 @@ def apply_pruning(
         print("[warn] No prune targets resolved; skipping pruning.")
         return
 
-    _merge_lora_adapters(model)
     replaced, original_params, compressed_params, details = (
         _apply_truncated_svd_to_model(model, targets, float(energy_threshold))
     )
@@ -568,6 +567,7 @@ def main() -> None:
             payload=raw_payload,
         )
 
+        merge_lora_adapters(model)
         params_before = _count_parameters(model)
         print(f"Model parameters before pruning: {params_before:,}")
 
@@ -580,8 +580,10 @@ def main() -> None:
 
         params_after = _count_parameters(model)
         params_diff = params_before - params_after
+        params_percent_diff = (params_before - params_after) / max(1, params_before)
         print(f"Model parameters after pruning: {params_after:,}")
         print(f"Parameter difference (before - after): {params_diff:+,}")
+        print(f"Parameter reduction: {params_percent_diff:.1%}")
 
         criterion = nn.CrossEntropyLoss()
         eval_limit = max(0, int(args.max_eval_batches))
@@ -637,8 +639,7 @@ def main() -> None:
                 "model/params_before": float(params_before),
                 "model/params_after": float(params_after),
                 "model/params_diff": float(params_diff),
-                "model/params_pct_reduction": (params_before - params_after)
-                / max(1, params_before),
+                "model/params_pct_reduction": float(params_percent_diff),
             }
         )
 

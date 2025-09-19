@@ -1,26 +1,38 @@
 make seval CHECKPOINT=lora.pt \
-  WANDB_RUN_NAME=eval_lora_tsvd0.95 \
-  PRUNE_AMOUNT=0.95 PRUNE_TARGETS=all
+  WANDB_RUN_NAME=eval_lora_tsvd0.99 \
+  PRUNE_AMOUNT=0.99 PRUNE_TARGETS=all
 
 make seval CHECKPOINT=fullft.pt \
-  WANDB_RUN_NAME=eval_fullft_tsvd0.95 \
-  PRUNE_AMOUNT=0.95 PRUNE_TARGETS=all
+  WANDB_RUN_NAME=eval_fullft_tsvd0.99 \
+  PRUNE_AMOUNT=0.99 PRUNE_TARGETS=all
 
 make seval CHECKPOINT=head_only.pt \
-  WANDB_RUN_NAME=eval_head_tsvd0.95 \
-  PRUNE_AMOUNT=0.95 PRUNE_TARGETS=all
+  WANDB_RUN_NAME=eval_head_tsvd0.99 \
+  PRUNE_AMOUNT=0.99 PRUNE_TARGETS=all
 
 make seval CHECKPOINT=lora.pt \
-  WANDB_RUN_NAME=eval_lora_tsvd1.0 \
-  PRUNE_AMOUNT=1.0 PRUNE_TARGETS=all
+  WANDB_RUN_NAME=eval_lora_tsvd0.98 \
+  PRUNE_AMOUNT=0.98 PRUNE_TARGETS=all
 
 make seval CHECKPOINT=fullft.pt \
-  WANDB_RUN_NAME=eval_fullft_tsvd1.0 \
-  PRUNE_AMOUNT=1.0 PRUNE_TARGETS=all
+  WANDB_RUN_NAME=eval_fullft_tsvd0.98 \
+  PRUNE_AMOUNT=0.98 PRUNE_TARGETS=all
 
 make seval CHECKPOINT=head_only.pt \
-  WANDB_RUN_NAME=eval_head_tsvd1.0 \
-  PRUNE_AMOUNT=1.0 PRUNE_TARGETS=all
+  WANDB_RUN_NAME=eval_head_tsvd0.98 \
+  PRUNE_AMOUNT=0.98 PRUNE_TARGETS=all
+
+make seval CHECKPOINT=lora.pt \
+  WANDB_RUN_NAME=eval_lora_tsvd0.97 \
+  PRUNE_AMOUNT=0.97 PRUNE_TARGETS=all
+
+make seval CHECKPOINT=fullft.pt \
+  WANDB_RUN_NAME=eval_fullft_tsvd0.97 \
+  PRUNE_AMOUNT=0.97 PRUNE_TARGETS=all
+
+make seval CHECKPOINT=head_only.pt \
+  WANDB_RUN_NAME=eval_head_tsvd0.97 \
+  PRUNE_AMOUNT=0.97 PRUNE_TARGETS=all
 
 # make sbaseline METHOD=head_only \
 #   WARMUP_STEPS=400 \
