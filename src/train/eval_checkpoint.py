@@ -145,6 +145,250 @@ def _prune_mlp_neurons(
 
 
 @torch.no_grad()
+def _svd_qk_product_per_head(
+    parent: nn.Module, energy_threshold: float
+) -> Optional[Tuple[int, int, int, List[Tuple[str, int, int, int]]]]:
+    """
+    Replace (q_proj, k_proj) in a single attention block `parent`
+    by low-rank factorizations derived from the SVD of the *augmented* product:
+        M_h = [Wq_h; bq_h^T] @ [Wk_h; 0]^T  \\in R^{(d_in+1) x (d_in+1)}
+    for each head h, where Wq_h, Wk_h are (d_in x d_h).
+
+    We realize the approximation with shared r_h bottlenecks:
+        Q' = (X @ U_h[:d_in,:r_h] + 1 * U_h[d_in,:r_h]) @ (Σ_h^{1/2} ⊕ 0)
+        K' = (X @ V_h[:d_in,:r_h] + 1 * V_h[d_in,:r_h]) @ (Σ_h^{1/2} ⊕ 0)
+    implemented as Sequential(Linear(d_in->r_total, bias=True), Linear(r_total->d_out, bias=False))
+    for q_proj and k_proj, with *block-diagonal* second layers.
+
+    Returns:
+        (1, original_params, new_params, details)
+        or None if nothing changed.
+    """
+    # sanity: need q_proj, k_proj, num_heads
+    if not (
+        hasattr(parent, "q_proj")
+        and hasattr(parent, "k_proj")
+        and hasattr(parent, "num_heads")
+    ):
+        return None
+    q: nn.Linear = parent.q_proj  # type: ignore
+    k: nn.Linear = parent.k_proj  # type: ignore
+    if not (isinstance(q, nn.Linear) and isinstance(k, nn.Linear)):
+        return None
+
+    device = q.weight.device
+    dtype = q.weight.dtype
+
+    d_out = q.out_features  # = H * d_h
+    d_in = q.in_features
+    H = int(getattr(parent, "num_heads"))
+    if H <= 0 or d_out % H != 0:
+        return None
+    d_h = d_out // H
+    if k.out_features != d_out or k.in_features != d_in:
+        return None
+
+    # Pull weights as (d_in, d_out)
+    Wq = q.weight.detach().to(dtype=torch.float32).T  # (d_in, d_out)
+    Wk = k.weight.detach().to(dtype=torch.float32).T  # (d_in, d_out)
+    bq = q.bias.detach().to(dtype=torch.float32) if (q.bias is not None) else None
+
+    # Per-head slices
+    head_slices = [(h * d_h, (h + 1) * d_h) for h in range(H)]
+
+    # Collect per-head SVDs & ranks
+    U_blocks: List[torch.Tensor] = []
+    V_blocks: List[torch.Tensor] = []
+    S_sqrts: List[torch.Tensor] = []
+    r_list: List[int] = []
+
+    svd_fail = False
+    total_energy_list: List[float] = []
+    for h, (s, e) in enumerate(head_slices):
+        Wq_h = Wq[:, s:e]  # (d_in, d_h)
+        Wk_h = Wk[:, s:e]  # (d_in, d_h)
+        bq_h = bq[s:e] if bq is not None else torch.zeros(d_h, dtype=Wq_h.dtype)
+
+        # Augment to include bias exactly: [W; b^T]
+        Wq_aug = torch.vstack([Wq_h, bq_h.unsqueeze(0)])  # (d_in+1, d_h)
+        Wk_aug = torch.vstack(
+            [Wk_h, torch.zeros(1, d_h, dtype=Wk_h.dtype)]
+        )  # (d_in+1, d_h)
+
+        # Product in augmented space
+        M = Wq_aug @ Wk_aug.T  # (d_in+1, d_in+1)
+
+        try:
+            U, S, Vh = torch.linalg.svd(M.to("cpu"), full_matrices=False)
+        except RuntimeError as exc:
+            print(
+                f"[warn] QK product SVD failed for head {h} ({exc}); skipping this block."
+            )
+            svd_fail = True
+            break
+
+        # Choose rank by energy on singular values of M
+        S2 = S**2
+        tot = float(torch.sum(S2))
+        total_energy_list.append(tot)
+        if tot == 0.0:
+            # nothing to compress in this head -> keep r=0 (skip)
+            r = 0
+        else:
+            cum = torch.cumsum(S2, dim=0) / torch.sum(S2)
+            thr = min(max(float(energy_threshold), 1e-6), 1.0)
+            r = int(torch.searchsorted(cum, thr).item()) + 1
+            r = max(1, min(r, min(M.shape[0], M.shape[1])))
+
+        # If rank doesn't reduce anything vs d_h and (d_in+1), it's still valid; param gate will decide later.
+        U_r = U[:, :r].contiguous()  # (d_in+1, r)
+        V_r = Vh[:r, :].mT.contiguous()  # (d_in+1, r)
+        S_rsq = torch.sqrt(S[:r]).contiguous()  # (r,)
+
+        U_blocks.append(U_r)
+        V_blocks.append(V_r)
+        S_sqrts.append(S_rsq)
+        r_list.append(r)
+
+    if svd_fail:
+        return None
+
+    r_total = int(sum(r_list))
+    if r_total == 0:
+        return None
+
+    # Parameter accounting (old vs new, per this *block* only)
+    q_bias_params = q.bias.numel() if q.bias is not None else 0
+    old_q = q.weight.numel() + q_bias_params
+    old_k = k.weight.numel() + (
+        k.bias.numel() if k.bias is not None else 0
+    )  # usually 0
+    old_params = old_q + old_k
+
+    # New (two-layer) parameter counts for q & k:
+    # First layers: (r_total * d_in) + r_total (bias)
+    # Second layers: (d_out * r_total), bias=False
+    new_q = (r_total * d_in) + r_total + (d_out * r_total)
+    new_k = (r_total * d_in) + r_total + (d_out * r_total)
+    new_params = new_q + new_k
+
+    if new_params >= old_params:
+        # Not worth replacing for this block
+        return None
+
+    # --- Build new q_proj, k_proj as Sequentials with block-diagonal second stage ---
+    # First stage weights/biases (stack all heads one under another)
+    W1_q = torch.zeros((r_total, d_in), dtype=dtype, device=device)
+    b1_q = torch.zeros((r_total,), dtype=dtype, device=device)
+    W1_k = torch.zeros((r_total, d_in), dtype=dtype, device=device)
+    b1_k = torch.zeros((r_total,), dtype=dtype, device=device)
+
+    # Second stage weights (block maps each head's r_h to its d_h slice through Σ^{1/2})
+    W2_q = torch.zeros((d_out, r_total), dtype=dtype, device=device)
+    W2_k = torch.zeros((d_out, r_total), dtype=dtype, device=device)
+
+    r_cursor = 0
+    for h, (s, e) in enumerate(head_slices):
+        r = r_list[h]
+        if r == 0:
+            continue
+        U_r = U_blocks[h].to(dtype=dtype, device=device)  # (d_in+1, r)
+        V_r = V_blocks[h].to(dtype=dtype, device=device)  # (d_in+1, r)
+        Sr = S_sqrts[h].to(dtype=dtype, device=device)  # (r,)
+
+        # First stage: rows are U[:d_in,:].T / V[:d_in,:].T ; bias comes from last row (augmented constant 1)
+        W1_q[r_cursor : r_cursor + r, :] = U_r[:d_in, :].mT
+        b1_q[r_cursor : r_cursor + r] = U_r[d_in, :]
+        W1_k[r_cursor : r_cursor + r, :] = V_r[:d_in, :].mT
+        b1_k[r_cursor : r_cursor + r] = V_r[d_in, :]
+
+        # Second stage: place Σ^{1/2} into the h-th head output slice, columns r_cursor: r_cursor+r
+        # We choose E_q = E_k = [I_r, 0], so W2_q[h_slice, cols] = diag(Sr); same for W2_k.
+        head_rows = slice(s, e)
+        cols = slice(r_cursor, r_cursor + r)
+        # diag(Sr) as (d_h x r) with top-left r x r diag; remaining rows zero
+        diagSr = torch.diag(Sr)  # (r, r)
+        # write into the top-left of the head slice; the placement choice is arbitrary but consistent for Q and K
+        W2_q[head_rows, cols] = torch.cat(
+            [diagSr, torch.zeros((d_h - r, r), dtype=dtype, device=device)], dim=0
+        )
+        W2_k[head_rows, cols] = torch.cat(
+            [diagSr, torch.zeros((d_h - r, r), dtype=dtype, device=device)], dim=0
+        )
+
+        r_cursor += r
+
+    # Assemble the Sequentials
+    q1 = nn.Linear(d_in, r_total, bias=True)
+    q2 = nn.Linear(r_total, d_out, bias=False)
+    k1 = nn.Linear(d_in, r_total, bias=True)
+    k2 = nn.Linear(r_total, d_out, bias=False)
+
+    # Move to device/dtype before copying
+    q1.to(device=device, dtype=dtype)
+    q2.to(device=device, dtype=dtype)
+    k1.to(device=device, dtype=dtype)
+    k2.to(device=device, dtype=dtype)
+
+    q1.weight.copy_(W1_q)
+    q1.bias.copy_(b1_q)
+    q2.weight.copy_(W2_q)
+    k1.weight.copy_(W1_k)
+    k1.bias.copy_(b1_k)
+    k2.weight.copy_(W2_k)
+
+    # Freeze by default (to match your SVD behavior); flip to True if you want post-FT recovery
+    for p in q1.parameters():
+        p.requires_grad = False
+    for p in q2.parameters():
+        p.requires_grad = False
+    for p in k1.parameters():
+        p.requires_grad = False
+    for p in k2.parameters():
+        p.requires_grad = False
+
+    # Install
+    parent.q_proj = nn.Sequential(q1, q2).to(device=device, dtype=dtype)  # type: ignore
+    parent.k_proj = nn.Sequential(k1, k2).to(device=device, dtype=dtype)  # type: ignore
+
+    # Summaries
+    details: List[Tuple[str, int, int, int]] = []
+    for h, r in enumerate(r_list):
+        details.append((f"head_{h}", d_in, d_h, r))
+
+    return 1, int(old_params), int(new_params), details
+
+
+@torch.no_grad()
+def _apply_qk_product_svd_to_model(
+    module: nn.Module, energy_threshold: float
+) -> Tuple[int, int, int, List[Tuple[str, int, int, int]]]:
+    """
+    Walks the model; whenever it finds a module with (q_proj, k_proj, num_heads),
+    applies the per-head QK-product SVD replacement if it reduces params.
+    """
+    changed = 0
+    orig = 0
+    new = 0
+    details_all: List[Tuple[str, int, int, int]] = []
+
+    for name, parent in module.named_modules():
+        result = _svd_qk_product_per_head(parent, energy_threshold)
+        if result is None:
+            continue
+        did, o, n, details = result
+        if did:
+            changed += 1
+            orig += o
+            new += n
+            # prefix details with block name
+            for d in details:
+                details_all.append((name + "." + d[0], d[1], d[2], d[3]))
+
+    return changed, orig, new, details_all
+
+
+@torch.no_grad()
 def merge_lora_adapters(module: nn.Module) -> int:
     to_replace: List[Tuple[str, LoRALinear]] = []
     for name, submodule in module.named_modules():
@@ -305,7 +549,7 @@ def parse_args() -> argparse.Namespace:
         "--prune_method",
         type=str,
         default="none",
-        help="Pruning method to apply (supported: none, truncated_svd, mlp_neurons).",
+        help="Pruning method to apply (supported: none, truncated_svd, mlp_neurons, qk_product).",
     )
     parser.add_argument(
         "--prune_amount",
@@ -578,6 +822,25 @@ def apply_pruning(
             print(f"    … {len(details) - 5} additional MLP blocks pruned")
         return
 
+    if method in {"qk_product", "qk", "qk-svd"}:
+        changed, original_params, compressed_params, details = (
+            _apply_qk_product_svd_to_model(model, threshold)
+        )
+        if changed == 0:
+            print(
+                "[info] QK product SVD did not modify any attention blocks (no param reduction at chosen threshold)."
+            )
+            return
+        reduction = 1.0 - (compressed_params / max(1, original_params))
+        print(
+            f"Applied QK-product SVD to {changed} attention blocks; "
+            f"params {original_params} → {compressed_params} ({reduction:.1%} reduction)."
+        )
+        for name, d_in, d_h, r in details[:6]:
+            print(f"  - {name}: d_in={d_in}, d_h={d_h} → rank {r}")
+        if len(details) > 6:
+            print(f"    … {len(details) - 6} additional heads")
+        return
     raise ValueError(f"Unsupported pruning method '{method}'.")
 
 
