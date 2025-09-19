@@ -101,6 +101,12 @@ def _truncated_svd_linear(
     if keep_rank >= min_dim:
         return None
 
+    bias_params = linear.bias.numel() if linear.bias is not None else 0
+    original_params = weight.numel() + bias_params
+    new_params_estimate = keep_rank * (in_features + out_features) + bias_params
+    if new_params_estimate >= original_params:
+        return None
+
     first = nn.Linear(in_features, keep_rank, bias=False)
     second = nn.Linear(keep_rank, out_features, bias=linear.bias is not None)
 
@@ -119,9 +125,6 @@ def _truncated_svd_linear(
         param.requires_grad = False
 
     new_module = nn.Sequential(first, second)
-    original_params = weight.numel() + (
-        linear.bias.numel() if linear.bias is not None else 0
-    )
     new_params = sum(p.numel() for p in new_module.parameters())
     return new_module, keep_rank, original_params, new_params
 
