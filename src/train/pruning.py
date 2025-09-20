@@ -30,6 +30,7 @@ PRUNE_METHOD_ALIASES = {
 
 
 def _canonicalize_prune_method(raw: str) -> str:
+    """Normalize a user supplied pruning method string to the canonical name."""
     token = raw.strip().lower()
     for canonical, aliases in PRUNE_METHOD_ALIASES.items():
         if token == canonical or token in aliases:
@@ -38,6 +39,7 @@ def _canonicalize_prune_method(raw: str) -> str:
 
 
 def _parse_prune_methods(raw: str) -> List[str]:
+    """Parse a comma-separated method spec into a deduplicated list of methods."""
     if not raw:
         return []
 
@@ -62,6 +64,7 @@ def _parse_prune_methods(raw: str) -> List[str]:
 
 
 def _validate_energy_threshold(value: float) -> float:
+    """Ensure the pruning energy threshold is in the open interval (0, 1]."""
     threshold = float(value)
     if not (0.0 < threshold <= 1.0):
         raise ValueError("Energy threshold must be in (0, 1].")
@@ -69,6 +72,7 @@ def _validate_energy_threshold(value: float) -> float:
 
 
 def _parse_prune_amounts(raw: str) -> Tuple[Optional[float], Dict[str, float]]:
+    """Interpret ``--prune-amount`` flags into defaults and per-method overrides."""
     if raw is None:
         return None, {}
 
@@ -110,6 +114,7 @@ def _parse_prune_amounts(raw: str) -> Tuple[Optional[float], Dict[str, float]]:
 
 
 def _parse_prune_targets(raw: str) -> List[str]:
+    """Resolve prune target strings, expanding wildcards to known defaults."""
     tokens = [t.strip() for t in raw.split(",") if t.strip()]
     if not tokens:
         return []
@@ -129,6 +134,7 @@ def _parse_prune_targets(raw: str) -> List[str]:
 def _resolve_parent_module(
     root: nn.Module, qualified_name: str
 ) -> Tuple[nn.Module, str]:
+    """Return ``(parent_module, leaf_name)`` for a dotted module path."""
     parts = qualified_name.split(".")
     parent = root
     for part in parts[:-1]:
@@ -145,17 +151,27 @@ def _count_parameters(module: nn.Module) -> int:
 def _prune_attention_heads(
     module: nn.Module, energy_threshold: float
 ) -> Tuple[int, int, int, List[Tuple[str, int, int]]]:
-    """Prune low-energy attention heads based on the output projection.
+    """
+    Prune low-importance attention heads in-place.
 
-    For every submodule that exposes ``q_proj``, ``k_proj``, ``v_proj`` and ``o_proj``
-    linears along with a ``num_heads`` attribute (e.g. ``DINOv3ViTAttention``), heads
-    are ranked by the L2 energy of the corresponding ``o_proj`` slices. The minimum
-    number of heads whose cumulative squared energy exceeds ``energy_threshold`` is
-    kept, with the remaining heads removed across all projections.
+    For each attention block exposing q_proj/k_proj/v_proj/o_proj and num_heads:
+      1) Compute a per-head score from o_proj by taking the L2 norm of the
+         column slice corresponding to that head (i.e., the block of size
+         head_dim in o_proj input columns).
+      2) Sort heads by score (desc) and pick the smallest K such that K heads
+         cumulative squared scores account for at least `energy_threshold`
+         fraction of total squared score. Always keep >= 1 head.
+      3) Rebuild q/k/v with selected output rows; rebuild o with selected
+         input columns. Preserve bias, dtype, device, and requires_grad.
+      4) Update num_heads (and related attrs if present).
 
-    Returns the tuple ``(blocks_pruned, original_params, new_params, details)`` where
-    ``details`` lists ``(module_name, previous_heads, kept_heads)`` for the pruned
-    attention blocks.
+    Returns:
+      (blocks_pruned, original_params, new_params, details)
+      where details = [(qualified_name, heads_before, heads_kept), ...].
+
+    Notes:
+      - Threshold is clamped to (1e-6, 1].
+      - Graph-safe: external shapes stay the same; only per-head channels shrink.
     """
 
     changed = 0
@@ -309,6 +325,24 @@ def _prune_attention_heads(
 def _prune_mlp_neurons(
     module: nn.Module, energy_threshold: float
 ) -> Tuple[int, int, int, List[Tuple[str, int, int]]]:
+    """
+    Prune hidden units of MLP blocks (up_proj/down_proj) in-place.
+
+    For each block with Linear up_proj (d_in -> r) and down_proj (r -> d_out):
+      1) For unit i, compute a score = ||row_i(W_up)||_2 * ||col_i(W_down)||_2.
+      2) Rank units by score (desc). Pick the smallest k such that k units cumulative
+         squared scores cover at least `energy_threshold` of the total. Keep >= 1.
+      3) Rebuild up_proj with the selected rows and down_proj with the selected
+         columns. Preserve bias, dtype, device, and requires_grad.
+
+    Returns:
+      (blocks_changed, original_params, new_params, details)
+      where details = [(qualified_name, width_before, width_after), ...].
+
+    Notes:
+      - Threshold is clamped to (1e-6, 1].
+      - Graph-safe: input/output dims of the block are preserved.
+    """
     changed = 0
     orig = 0
     new = 0
@@ -396,6 +430,7 @@ def _prune_mlp_neurons(
 
 @torch.no_grad()
 def merge_lora_adapters(module: nn.Module) -> int:
+    """Fold all LoRA adapters in ``module`` into their base linears, returning count."""
     to_replace: List[Tuple[str, LoRALinear]] = []
     for name, submodule in module.named_modules():
         if isinstance(submodule, LoRALinear):
@@ -414,6 +449,23 @@ def merge_lora_adapters(module: nn.Module) -> int:
 def _truncated_svd_linear(
     linear: nn.Linear, energy_threshold: float
 ) -> Optional[Tuple[nn.Module, int, int, int]]:
+    """
+    Factorize a Linear layer into two smaller linears via truncated SVD.
+
+    Steps:
+      1) Compute thin SVD of weight W (on CPU, float32 for stability).
+      2) Choose the smallest rank r whose cumulative squared singular values
+         reach `energy_threshold` of the total (keep >= 1, and r <= min(out,in)).
+      3) Build Sequential(Linear(in->r, bias=False), Linear(r->out, bias=orig)).
+         The first weight is V^T[:r], the second is U[:, :r] * S[:r].
+      4) Match dtype/device; set new params requires_grad=False by default.
+
+    Only returns a factorization if it *reduces* parameter count. Otherwise
+    returns None.
+
+    Returns:
+      (new_module, rank_kept, original_params, new_params) or None.
+    """
     weight = linear.weight.detach()
     out_features, in_features = weight.shape
     min_dim = min(out_features, in_features)
@@ -472,6 +524,17 @@ def _truncated_svd_linear(
 def _apply_truncated_svd_to_model(
     module: nn.Module, target_keys: List[str], energy_threshold: float
 ) -> Tuple[int, int, int, List[Tuple[str, int, int, int]]]:
+    """
+    Apply truncated-SVD to all Linear layers whose qualified name contains any
+    of the substrings in `target_keys` (e.g., ["q_proj","k_proj","up_proj"]).
+
+    Each matching Linear is replaced in-place by a two-layer factorization
+    from `_truncated_svd_linear`, provided it reduces parameters.
+
+    Returns:
+      (replaced, original_params, compressed_params, details)
+      where details = [(qualified_name, in_features, out_features, rank_kept), ...].
+    """
     if not target_keys:
         return 0, 0, 0, []
 
@@ -501,6 +564,7 @@ def _apply_truncated_svd_to_model(
 
 
 def parse_args() -> argparse.Namespace:
+    """Build the pruning/eval CLI, returning parsed arguments."""
     parser = argparse.ArgumentParser(
         description="Load a checkpoint and evaluate it on PCam validation/test splits."
     )
@@ -612,6 +676,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def resolve_checkpoint(path: str) -> str:
+    """Resolve relative checkpoint paths against ``CHECKPOINT_ROOT``."""
     if os.path.isabs(path):
         return path
     candidate = os.path.join(CHECKPOINT_ROOT, path)
@@ -619,6 +684,7 @@ def resolve_checkpoint(path: str) -> str:
 
 
 def infer_checkpoint_type(path: str) -> str:
+    """Guess the checkpoint type from filename keywords."""
     name = os.path.basename(path).lower()
     if "lora" in name:
         return "lora"
@@ -635,6 +701,7 @@ def extract_training_metadata(
     payload: Dict[str, object],
     args: argparse.Namespace,
 ) -> Tuple[str, int]:
+    """Recover model id and resolution, honoring CLI overrides and checkpoint hints."""
     ckpt_args = payload.get("args", {}) if isinstance(payload, dict) else {}
     ckpt_model_id = None
     ckpt_resolution = None
@@ -662,6 +729,7 @@ def extract_training_metadata(
 def _apply_backbone_overrides(
     module: nn.Module, overrides: Dict[str, torch.Tensor]
 ) -> int:
+    """Load saved LayerNorm/bias overrides into a backbone module."""
     if not overrides:
         return 0
     sd = module.state_dict()
@@ -696,6 +764,7 @@ def load_model(
     device: str,
     payload: Optional[Dict[str, object]] = None,
 ) -> Tuple[DinoV3PCam, Dict[str, object]]:
+    """Construct a DinoV3PCam model from a checkpoint, loading adapters if needed."""
     if payload is None:
         payload = torch.load(checkpoint_path, map_location="cpu")
     assert payload is not None
@@ -777,6 +846,7 @@ def load_model(
 def _apply_single_pruning(
     model: nn.Module, method: str, energy_threshold: float, target_spec: str
 ) -> None:
+    """Execute one pruning strategy in-place, printing a summary of changes."""
     threshold = _validate_energy_threshold(energy_threshold)
 
     if method == "truncated_svd":
@@ -855,6 +925,22 @@ def apply_pruning(
     default_threshold: Optional[float],
     target_spec: str,
 ) -> None:
+    """
+    Run the requested pruning methods sequentially on `model` (in-place).
+
+    Supported methods:
+      - "attention_heads": prune heads by o_proj energy.
+      - "mlp_neurons": prune hidden units by multiplicative salience.
+      - "truncated_svd": low-rank factorization of selected Linear layers.
+
+    Threshold selection:
+      - For each method m, use method_thresholds[m] if provided, else use
+        default_threshold. Thresholds are energy fractions in (0, 1].
+
+    `target_spec` (only for "truncated_svd"):
+      - Comma-separated substrings; "all"/"*" expands to the standard set
+        (q_proj,k_proj,v_proj,o_proj,up_proj,down_proj).
+    """
     if not methods:
         return
 
@@ -875,6 +961,7 @@ def apply_pruning(
 def init_wandb(
     args: argparse.Namespace, metadata: Dict[str, object]
 ) -> Tuple[Optional[Any], Optional[Any]]:
+    """Initialize a wandb run for pruning/evaluation logging when requested."""
     if not args.wandb:
         return None, None
 
@@ -909,6 +996,7 @@ def log_wandb_metrics(
     log_payload: Dict[str, float],
     summary_payload: Optional[Dict[str, float]] = None,
 ) -> None:
+    """Send metrics to wandb and optionally update the summary table."""
     if wandb_module is None:
         return
     wandb_module.log(log_payload)
@@ -917,11 +1005,13 @@ def log_wandb_metrics(
 
 
 def finalize_wandb(wandb_module: Optional[Any]) -> None:
+    """Gracefully close the wandb run if logging was enabled."""
     if wandb_module is not None:
         wandb_module.finish()
 
 
 def main() -> None:
+    """CLI entry point for loading, pruning, and evaluating DinoV3 checkpoints."""
     args = parse_args()
     prune_methods = _parse_prune_methods(args.prune_method)
     default_prune_amount, prune_amount_overrides = _parse_prune_amounts(

@@ -23,6 +23,7 @@ from src.utils.data_utils import build_eval_loaders, build_train_loader
 
 
 def build_lr_log(opt, prefix: str, global_step: int):
+    """Return a flat dict capturing learning rates for each optimizer group."""
     log = {"global_step": global_step}
     for i, g in enumerate(opt.param_groups):
         tag = g.get("name", f"group{i}")
@@ -81,6 +82,7 @@ def enable_and_collect_norms_bias(
 
 
 def state_dict_cpu(m: nn.Module) -> Dict[str, torch.Tensor]:
+    """Detaches and moves all tensors in a module state dict onto CPU memory."""
     return {k: v.detach().to("cpu") for k, v in m.state_dict().items()}
 
 
@@ -95,6 +97,7 @@ def lora_adapter_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
 
 
 def save_checkpoint_full(path: str, model: nn.Module, args, extra=None):
+    """Persist a full fine-tune checkpoint including the complete model state."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {
         "type": "full",
@@ -106,6 +109,7 @@ def save_checkpoint_full(path: str, model: nn.Module, args, extra=None):
 
 
 def save_checkpoint_head(path: str, model: nn.Module, args, extra=None):
+    """Store only head weights (and optional norm/bias overrides) for frozen-backbone runs."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     # grab LayerNorm/bias overrides if they were trained
     backbone_overrides = collect_backbone_overrides(
@@ -129,6 +133,7 @@ def save_checkpoint_head(path: str, model: nn.Module, args, extra=None):
 
 
 def save_checkpoint_lora(path: str, model: nn.Module, args, extra=None):
+    """Write a LoRA checkpoint containing adapters, head weights, and metadata."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     # grab LayerNorm/bias overrides if they were trained
     backbone_overrides = collect_backbone_overrides(
@@ -188,6 +193,7 @@ def collect_backbone_overrides(
 
 
 def parse_args():
+    """Create the CLI argument parser for linear probing and fine-tuning runs."""
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--method",
@@ -349,6 +355,7 @@ def parse_args():
 
 
 def _is_better(new, best, metric):
+    """Return True when ``new`` improves upon ``best`` for the configured metric."""
     maximize = {"auroc", "sens95", "acc"}
     minimize = {"val_loss", "nll", "brier", "ece"}
     if metric in maximize:
@@ -359,7 +366,10 @@ def _is_better(new, best, metric):
 
 
 class LinearTrainer:
+    """Co-ordinates fine-tuning flows for DinoV3 PCam classification experiments."""
+
     def __init__(self, args):
+        """Initialize loaders, model, optimizers, and logging surfaces for a run."""
         self.args = args
         self.run_name = f"{time.strftime('%Y%m%d-%H%M%S')}-{self.args.method}"
         self.run_dir = os.path.join(self.args.save_dir, self.run_name)
@@ -402,6 +412,7 @@ class LinearTrainer:
         self.best_state = None
 
     def train(self):
+        """Run the full training loop with optional mid-epoch and epoch-end evals."""
         self._log_system_stats()
         self._maybe_epoch_zero_eval()
 
@@ -417,6 +428,7 @@ class LinearTrainer:
         self._finalize_wandb()
 
     def _init_wandb(self):
+        """Boot a wandb run when enabled and register core run metadata."""
         if not self.args.wandb:
             return
         import wandb
@@ -461,6 +473,7 @@ class LinearTrainer:
         self.wandb_run = run
 
     def _build_dataloaders(self):
+        """Construct train/val/test dataloaders with appropriate transforms and device."""
         train_loader = build_train_loader(
             data_dir=self.args.data_dir,
             model_id=self.args.model_id,
@@ -481,6 +494,7 @@ class LinearTrainer:
         return train_loader, val_loader, test_loader
 
     def _compute_val_schedule(self) -> int:
+        """Compute how frequently to trigger mid-epoch validation the loop should honor."""
         if not self.args.val_mid_epoch:
             return 0
         if not self.args.val_eval_frac or self.args.val_eval_frac <= 0:
@@ -488,6 +502,7 @@ class LinearTrainer:
         return max(1, int(round(self.effective_steps * self.args.val_eval_frac)))
 
     def _prepare_model_and_optimizer(self):
+        """Instantiate backbone/head, build optimizer parameter groups, and LRs."""
         backbone = DinoV3Backbone(model_id=self.args.model_id, dtype=torch.float32)
         model = DinoV3PCam(backbone).to(self.device)
 
@@ -617,6 +632,7 @@ class LinearTrainer:
         return model, optimizer, scheduler, meta
 
     def _log_system_stats(self):
+        """Record baseline parameter counts to wandb for traceability."""
         log = {
             "global_step": self.global_step,
             "systems/params_total": self.params_total,
@@ -636,6 +652,7 @@ class LinearTrainer:
         self._wandb_summary_update(summary)
 
     def _maybe_epoch_zero_eval(self):
+        """Optionally evaluate before training to capture a baseline metric snapshot."""
         if not self.args.val_epoch0:
             return
         t0 = time.time()
@@ -653,6 +670,7 @@ class LinearTrainer:
         print(f"[epoch-0 val] full loss={val_loss:.4f} ({dt:.2f}s)")
 
     def _train_epoch(self, epoch: int) -> Tuple[float, int]:
+        """Train for a single epoch and return summed loss and sample count."""
         self.model.train()
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.args.epochs}")
         running_loss = 0.0
@@ -695,6 +713,7 @@ class LinearTrainer:
         return running_loss, train_samples_seen
 
     def _train_step(self, batch):
+        """Execute one optimizer update on the provided batch."""
         x, y = batch
         x = x.to(self.device, non_blocking=True)
         y = y.to(self.device, non_blocking=True)
@@ -711,6 +730,7 @@ class LinearTrainer:
         return loss.item(), bs
 
     def _should_run_mid_eval(self, batch_idx: int) -> bool:
+        """Return True when the mid-epoch evaluation trigger condition is satisfied."""
         if not self.args.val_mid_epoch or self.val_every_steps <= 0:
             return False
         return (
@@ -718,6 +738,7 @@ class LinearTrainer:
         ) == 0 or batch_idx == self.effective_steps
 
     def _run_mid_epoch_eval(self):
+        """Measure validation loss/metrics during training for early insight."""
         t0 = time.time()
         val_loss, metrics = self._evaluate_val_full(heavy=self.args.val_heavy_mid)
         dt = time.time() - t0
@@ -732,6 +753,7 @@ class LinearTrainer:
         print(f"\n[mid-val] full loss={val_loss:.4f} ({dt:.2f}s)")
 
     def _handle_epoch_end_eval(self, epoch: int, train_loss_epoch: float):
+        """Evaluate, log, and track best checkpoint at the end of an epoch."""
         t0 = time.time()
         need_heavy = self.args.val_heavy_end or (self.args.select_metric != "val_loss")
         val_loss, metrics = self._evaluate_val_full(heavy=need_heavy)
@@ -771,6 +793,7 @@ class LinearTrainer:
     def _select_metric_value(
         self, val_loss: float, metrics: Optional[Dict[str, float]]
     ):
+        """Resolve which scalar should drive checkpoint selection for this run."""
         metric = self.args.select_metric
         if metric == "val_loss":
             return float(val_loss)
@@ -792,6 +815,7 @@ class LinearTrainer:
     def _maybe_update_best(
         self, epoch: int, val_loss: float, sel_value: float, tie_value: float
     ):
+        """Update ``best_state`` and optionally write a best checkpoint snapshot."""
         current_best = (
             None if self.best_state is None else self.best_state["select_value"]
         )
@@ -822,6 +846,7 @@ class LinearTrainer:
                 self._save_checkpoint("best", extra)
 
     def _evaluate_val_full(self, heavy: bool):
+        """Compute validation loss and optionally heavy metrics on the main loader."""
         was_training = self.model.training
         val_loss = evaluate_loss(
             self.model,
@@ -842,6 +867,7 @@ class LinearTrainer:
         return float(val_loss), metrics
 
     def _evaluate_metrics(self, loader, use_tta: bool = False):
+        """Run heavy evaluation on an arbitrary loader, restoring train/eval state."""
         was_training = self.model.training
         metrics = evaluate(
             self.model,
@@ -854,6 +880,7 @@ class LinearTrainer:
         return metrics
 
     def _format_val_metrics(self, metrics: Dict[str, float]) -> Dict[str, float]:
+        """Rename evaluation keys so val metrics render nicely in wandb dashboards."""
         return {
             "val/AUROC": metrics["AUROC"],
             "val/AUPRC": metrics["AUPRC"],
@@ -865,6 +892,7 @@ class LinearTrainer:
         }
 
     def _final_evaluation(self):
+        """Restore the best state (if any) and report final validation/test metrics."""
         print("Final evaluation (heavy metrics) on full val & test...")
         if self.best_state is not None:
             self.model.load_state_dict(self.best_state["state_dict"], strict=True)
@@ -938,6 +966,7 @@ class LinearTrainer:
         lat_ms: float,
         thr: float,
     ):
+        """Pretty-print the closing metrics, FLOPs, and latency numbers."""
         print("\n== Final VAL metrics ==")
         for k, v in val_metrics_full.items():
             print(f"{k}: {v:.4f}")
@@ -949,6 +978,7 @@ class LinearTrainer:
         print(f"Latency (ms/img): {lat_ms:.2f} | Throughput (img/s): {thr:.2f}")
 
     def _save_last_checkpoint(self, val_metrics, test_metrics):
+        """Persist the final model state if ``--save_last`` was requested."""
         if not self.args.save_last:
             return
         extra = {
@@ -959,6 +989,7 @@ class LinearTrainer:
         self._save_checkpoint("last", extra)
 
     def _save_checkpoint(self, prefix: str, extra):
+        """Dispatch to the correct checkpoint writer based on training method."""
         filename = self._checkpoint_filename(prefix)
         path = os.path.join(self.run_dir, filename)
         if self.args.method == "fullft":
@@ -971,6 +1002,7 @@ class LinearTrainer:
             raise ValueError(f"Unknown method: {self.args.method}")
 
     def _checkpoint_filename(self, prefix: str) -> str:
+        """Return a filename stem tailored to the current fine-tuning method."""
         if self.args.method == "fullft":
             return f"{prefix}_full.pt"
         if self.args.method == "lora":
@@ -980,6 +1012,7 @@ class LinearTrainer:
         raise ValueError(f"Unknown method: {self.args.method}")
 
     def _finalize_wandb(self):
+        """Record summary stats and close the wandb run if one is active."""
         if self.wandb_run is None or self.wandb is None:
             return
         best_val_loss = None
@@ -992,15 +1025,18 @@ class LinearTrainer:
         self.wandb.finish()
 
     def _wandb_log(self, payload: Dict[str, object]):
+        """Log a payload to wandb when logging is enabled."""
         if self.wandb is not None:
             self.wandb.log(payload)
 
     def _wandb_summary_update(self, payload: Dict[str, object]):
+        """Apply summary updates to the active wandb run (if any)."""
         if self.wandb_run is not None:
             self.wandb_run.summary.update(payload)
 
 
 def main():
+    """Entry point used by CLI scripts to run fine-tuning with parsed args."""
     args = parse_args()
     args.lr_head = args.lr if args.lr_head is None else args.lr_head
     args.lr_backbone = args.lr if args.lr_backbone is None else args.lr_backbone
