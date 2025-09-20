@@ -1,18 +1,7 @@
 make seval CHECKPOINT=fullft.pt \
-  WANDB_RUN_NAME=eval_fullft_attn0.89 \
-  PRUNE_AMOUNT=0.89 PRUNE_TARGETS=all PRUNE_METHOD=attention_heads
-
-make seval CHECKPOINT=fullft.pt \
-  WANDB_RUN_NAME=eval_fullft_attn0.88 \
-  PRUNE_AMOUNT=0.88 PRUNE_TARGETS=all PRUNE_METHOD=attention_heads
-
-make seval CHECKPOINT=fullft.pt \
-  WANDB_RUN_NAME=eval_fullft_attn0.87 \
-  PRUNE_AMOUNT=0.87 PRUNE_TARGETS=all PRUNE_METHOD=attention_heads
-
-make seval CHECKPOINT=fullft.pt \
-  WANDB_RUN_NAME=eval_fullft_attn0.86 \
-  PRUNE_AMOUNT=0.86 PRUNE_TARGETS=all PRUNE_METHOD=attention_heads
+  WANDB_RUN_NAME=eval_fullft_attn-mlp-tsvd_0.89-0.975-0.975 \
+  PRUNE_TARGETS=all PRUNE_METHOD=attention_heads,mlp_neurons,truncated_svd \
+  PRUNE_AMOUNT=attention_heads=0.89,mlp_neurons=0.975,truncated_svd=0.975
 
 ###
 

@@ -1,6 +1,6 @@
 import argparse
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -21,6 +21,92 @@ KNOWN_SVD_TARGETS = [
     "up_proj",
     "down_proj",
 ]
+
+PRUNE_METHOD_ALIASES = {
+    "truncated_svd": {"truncated_svd", "svd", "tsvd"},
+    "attention_heads": {"attention_heads", "attn_heads", "attention", "head_prune"},
+    "mlp_neurons": {"mlp_neurons", "mlp", "mlp-prune", "mlp-neurons"},
+}
+
+
+def _canonicalize_prune_method(raw: str) -> str:
+    token = raw.strip().lower()
+    for canonical, aliases in PRUNE_METHOD_ALIASES.items():
+        if token == canonical or token in aliases:
+            return canonical
+    raise ValueError(f"Unsupported pruning method '{raw}'.")
+
+
+def _parse_prune_methods(raw: str) -> List[str]:
+    if not raw:
+        return []
+
+    tokens = [token.strip() for token in raw.split(",") if token.strip()]
+    if not tokens:
+        return []
+
+    lowered = [token.lower() for token in tokens]
+    if lowered == ["none"]:
+        return []
+    if any(token == "none" for token in lowered):
+        raise ValueError("'none' cannot be combined with other pruning methods.")
+
+    methods: List[str] = []
+    seen: Set[str] = set()
+    for token in tokens:
+        canonical = _canonicalize_prune_method(token)
+        if canonical not in seen:
+            methods.append(canonical)
+            seen.add(canonical)
+    return methods
+
+
+def _validate_energy_threshold(value: float) -> float:
+    threshold = float(value)
+    if not (0.0 < threshold <= 1.0):
+        raise ValueError("Energy threshold must be in (0, 1].")
+    return threshold
+
+
+def _parse_prune_amounts(raw: str) -> Tuple[Optional[float], Dict[str, float]]:
+    if raw is None:
+        return None, {}
+
+    text = str(raw).strip()
+    if not text:
+        return None, {}
+
+    try:
+        return _validate_energy_threshold(float(text)), {}
+    except ValueError:
+        pass
+
+    default_value: Optional[float] = None
+    overrides: Dict[str, float] = {}
+
+    for token in text.split(","):
+        part = token.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(
+                "Prune amounts must be provided as '<method>=<value>' or a single float."
+            )
+        key, raw_value = part.split("=", 1)
+        key = key.strip().lower()
+        if not key:
+            raise ValueError("Missing method name in prune amount specification.")
+        value = _validate_energy_threshold(float(raw_value))
+        if key in {"default", "*", "all"}:
+            default_value = value
+            continue
+        canonical = _canonicalize_prune_method(key)
+        overrides[canonical] = value
+
+    if not overrides and default_value is None:
+        raise ValueError("No valid prune amounts parsed from input.")
+
+    return default_value, overrides
 
 
 def _parse_prune_targets(raw: str) -> List[str]:
@@ -470,16 +556,17 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="none",
         help=(
-            "Pruning method to apply (supported: none, truncated_svd, attention_heads, "
-            "mlp_neurons)."
+            "Comma-separated pruning methods to apply sequentially (supported: none, "
+            "truncated_svd, attention_heads, mlp_neurons)."
         ),
     )
     parser.add_argument(
         "--prune_amount",
-        type=float,
-        default=0.95,
+        type=str,
+        default="0.95",
         help=(
-            "Energy threshold for energy-based pruning (fraction of squared norm to keep)."
+            "Energy threshold specification. Provide a single float for all methods "
+            "or override per method, e.g. 'attention_heads=0.9,truncated_svd=0.85'."
         ),
     )
     parser.add_argument(
@@ -687,18 +774,12 @@ def load_model(
     return model, payload
 
 
-def apply_pruning(
+def _apply_single_pruning(
     model: nn.Module, method: str, energy_threshold: float, target_spec: str
 ) -> None:
-    method = method.strip().lower()
-    if method in {"none", ""}:
-        return
+    threshold = _validate_energy_threshold(energy_threshold)
 
-    threshold = float(energy_threshold)
-    if not (0.0 < threshold <= 1.0):
-        raise ValueError("Energy threshold must be in (0, 1].")
-
-    if method in {"truncated_svd", "svd", "tsvd"}:
+    if method == "truncated_svd":
         targets = _parse_prune_targets(target_spec)
         if not targets:
             print("[warn] No prune targets resolved; skipping pruning.")
@@ -724,7 +805,7 @@ def apply_pruning(
             print(f"    … {len(details) - 5} additional layers compressed")
         return
 
-    if method in {"attention_heads", "attn_heads", "attention", "head_prune"}:
+    if method == "attention_heads":
         changed, original_params, compressed_params, details = _prune_attention_heads(
             model, threshold
         )
@@ -744,7 +825,7 @@ def apply_pruning(
             print(f"    … {len(details) - 5} additional attention blocks pruned")
         return
 
-    if method in {"mlp", "mlp_neurons", "mlp-prune", "mlp-neurons"}:
+    if method == "mlp_neurons":
         changed, original_params, compressed_params, details = _prune_mlp_neurons(
             model, threshold
         )
@@ -765,6 +846,30 @@ def apply_pruning(
         return
 
     raise ValueError(f"Unsupported pruning method '{method}'.")
+
+
+def apply_pruning(
+    model: nn.Module,
+    methods: List[str],
+    method_thresholds: Dict[str, float],
+    default_threshold: Optional[float],
+    target_spec: str,
+) -> None:
+    if not methods:
+        return
+
+    for method in methods:
+        if method not in PRUNE_METHOD_ALIASES:
+            raise ValueError(f"Unsupported pruning method '{method}'.")
+        threshold = method_thresholds.get(method, default_threshold)
+        if threshold is None:
+            raise ValueError(
+                f"No prune_amount specified for method '{method}'. Provide a default or explicit value."
+            )
+        print(
+            f"Applying pruning method '{method}' with energy threshold {threshold:.4f}."
+        )
+        _apply_single_pruning(model, method, threshold, target_spec)
 
 
 def init_wandb(
@@ -818,6 +923,20 @@ def finalize_wandb(wandb_module: Optional[Any]) -> None:
 
 def main() -> None:
     args = parse_args()
+    prune_methods = _parse_prune_methods(args.prune_method)
+    default_prune_amount, prune_amount_overrides = _parse_prune_amounts(
+        args.prune_amount
+    )
+    if prune_methods and default_prune_amount is None:
+        missing = [
+            method for method in prune_methods if method not in prune_amount_overrides
+        ]
+        if missing:
+            joined = ", ".join(missing)
+            raise ValueError(
+                "Missing prune_amount specification for: "
+                f"{joined}. Provide explicit values or a default."
+            )
     checkpoint_path = resolve_checkpoint(args.checkpoint)
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found at '{checkpoint_path}'.")
@@ -841,7 +960,10 @@ def main() -> None:
         "resolved_image_size": image_size,
         "device": device,
         "prune_method": args.prune_method,
+        "prune_methods_resolved": prune_methods,
         "prune_amount": args.prune_amount,
+        "prune_amount_default": default_prune_amount,
+        "prune_amount_overrides": prune_amount_overrides,
         "prune_targets": args.prune_targets,
     }
     wandb_module, wandb_run = init_wandb(args, wandb_metadata)
@@ -870,8 +992,9 @@ def main() -> None:
 
         apply_pruning(
             model,
-            args.prune_method,
-            args.prune_amount,
+            prune_methods,
+            prune_amount_overrides,
+            default_prune_amount,
             args.prune_targets,
         )
 
