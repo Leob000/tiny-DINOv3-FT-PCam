@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from src.models.backbone_dinov3 import DinoV3Backbone, DinoV3PCam
 from src.models.lora import LoRALinear, inject_lora
-from src.train.data_utils import build_eval_loaders
+from src.utils.data_utils import build_eval_loaders
 from src.utils.eval_utils import evaluate, get_device, evaluate_loss
 
 DEFAULT_MODEL_ID = "facebook/dinov3-vits16-pretrain-lvd1689m"

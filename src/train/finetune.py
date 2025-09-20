@@ -19,7 +19,7 @@ from src.utils.eval_utils import (
     time_latency,
 )
 from src.utils.seed import set_seed
-from src.train.data_utils import build_eval_loaders, build_train_loader
+from src.utils.data_utils import build_eval_loaders, build_train_loader
 
 
 def build_lr_log(opt, prefix: str, global_step: int):

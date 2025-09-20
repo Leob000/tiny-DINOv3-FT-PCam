@@ -42,7 +42,7 @@ PRUNE_TARGETS?=all
 WANDB_RUN_NAME?=eval_run
 
 eval:
-	$(PY) -m src.train.eval_checkpoint \
+	$(PY) -m src.train.pruning \
 		--checkpoint $(CHECKPOINT) \
 		--data_dir $(DATA_DIR) \
 		--model_id $(MODEL_ID) \
@@ -53,7 +53,7 @@ eval:
 		--tta_eval
 
 baseline:
-	$(PY) -m src.train.train_linear \
+	$(PY) -m src.train.finetune \
 		--data_dir $(DATA_DIR) \
 		--model_id $(MODEL_ID) \
     --select_metric $(SELECT_METRIC) \
@@ -79,7 +79,7 @@ baseline:
 		--save_best
 
 debug:
-	$(PY) -m src.train.train_linear \
+	$(PY) -m src.train.finetune \
 		--method $(METHOD) \
 		--data_dir $(DATA_DIR) \
 		--model_id $(MODEL_ID) \
@@ -113,7 +113,7 @@ SBATCH = sbatch \
 	--nodes=1 \
 	--ntasks-per-node=1
 
-COMMON = $(PY) -m src.train.train_linear \
+COMMON = $(PY) -m src.train.finetune \
   --data_dir $(DATA_DIR) \
   --model_id $(MODEL_ID) \
   --select_metric $(SELECT_METRIC) \
@@ -136,7 +136,7 @@ COMMON = $(PY) -m src.train.train_linear \
 	--aug_histology --tta_eval \
   --save_best
 
-COMMON2 = $(PY) -m src.train.eval_checkpoint \
+COMMON2 = $(PY) -m src.train.pruning \
 	--checkpoint $(CHECKPOINT) \
   $(WANDB) --wandb_project dinov3-pcam-compress \
 	--wandb_run_name $(WANDB_RUN_NAME) \
