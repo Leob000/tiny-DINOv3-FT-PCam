@@ -36,8 +36,8 @@ VAL_FLAGS_NO_MID=--val_epoch_end --val_heavy_end
 TRAIN_NORMS_BIAS?=none # [none, norms, bias, both] train the LayerNorms params for head_only/LoRA methods
 
 CHECKPOINT?=lora.pt
-PRUNE_METHOD?=qk_product
-PRUNE_AMOUNT?=0.95
+PRUNE_METHOD?=attention_heads
+PRUNE_AMOUNT?=0.8
 PRUNE_TARGETS?=all
 WANDB_RUN_NAME?=eval_run
 

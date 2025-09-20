@@ -56,6 +56,170 @@ def _count_parameters(module: nn.Module) -> int:
 
 
 @torch.no_grad()
+def _prune_attention_heads(
+    module: nn.Module, energy_threshold: float
+) -> Tuple[int, int, int, List[Tuple[str, int, int]]]:
+    """Prune low-energy attention heads based on the output projection.
+
+    For every submodule that exposes ``q_proj``, ``k_proj``, ``v_proj`` and ``o_proj``
+    linears along with a ``num_heads`` attribute (e.g. ``DINOv3ViTAttention``), heads
+    are ranked by the L2 energy of the corresponding ``o_proj`` slices. The minimum
+    number of heads whose cumulative squared energy exceeds ``energy_threshold`` is
+    kept, with the remaining heads removed across all projections.
+
+    Returns the tuple ``(blocks_pruned, original_params, new_params, details)`` where
+    ``details`` lists ``(module_name, previous_heads, kept_heads)`` for the pruned
+    attention blocks.
+    """
+
+    changed = 0
+    orig_params = 0
+    new_params = 0
+    info: List[Tuple[str, int, int]] = []
+
+    thr = min(max(float(energy_threshold), 1e-6), 1.0)
+
+    for name, parent in module.named_modules():
+        has_projections = all(
+            hasattr(parent, attr) for attr in ("q_proj", "k_proj", "v_proj", "o_proj")
+        )
+        if not (has_projections and hasattr(parent, "num_heads")):
+            continue
+
+        q, k, v, o = parent.q_proj, parent.k_proj, parent.v_proj, parent.o_proj
+        if not all(isinstance(x, nn.Linear) for x in (q, k, v, o)):
+            continue
+        assert isinstance(q, nn.Linear)
+        assert isinstance(k, nn.Linear)
+        assert isinstance(v, nn.Linear)
+        assert isinstance(o, nn.Linear)
+
+        d_model = q.out_features
+        num_heads = int(getattr(parent, "num_heads"))
+        if num_heads <= 1:
+            continue
+
+        head_dim = d_model // num_heads
+        if head_dim * num_heads != d_model:
+            continue
+
+        # Rank heads by the energy (squared norm) of the corresponding o_proj slice.
+        wo = o.weight.detach()  # (d_model, d_model)
+        head_scores = (
+            wo[:, : num_heads * head_dim]
+            .reshape(d_model, num_heads, head_dim)
+            .norm(dim=(0, 2))
+        )  # (num_heads,)
+
+        energy = head_scores.square()
+        total_energy = float(torch.sum(energy))
+        if total_energy <= 0.0:
+            continue
+
+        order = torch.argsort(head_scores, descending=True)
+        cum = torch.cumsum(energy[order], dim=0) / total_energy
+        keep_heads = int(torch.searchsorted(cum, thr).item()) + 1
+        keep_heads = max(1, min(keep_heads, num_heads))
+
+        if keep_heads >= num_heads:
+            continue
+
+        keep = torch.sort(order[:keep_heads]).values.tolist()
+
+        def _expand_indices(indices: List[int]) -> List[int]:
+            expanded: List[int] = []
+            for h in indices:
+                start = h * head_dim
+                expanded.extend(range(start, start + head_dim))
+            return expanded
+
+        rows = _expand_indices(keep)  # selection for q/k/v output rows
+        cols = _expand_indices(keep)  # selection for o input columns
+
+        device = q.weight.device
+        dtype = q.weight.dtype
+
+        new_q = nn.Linear(
+            q.in_features,
+            keep_heads * head_dim,
+            bias=q.bias is not None,
+            device=device,
+            dtype=dtype,
+        )
+        new_k = nn.Linear(
+            k.in_features,
+            keep_heads * head_dim,
+            bias=k.bias is not None,
+            device=device,
+            dtype=dtype,
+        )
+        new_v = nn.Linear(
+            v.in_features,
+            keep_heads * head_dim,
+            bias=v.bias is not None,
+            device=device,
+            dtype=dtype,
+        )
+        new_o = nn.Linear(
+            keep_heads * head_dim,
+            o.out_features,
+            bias=o.bias is not None,
+            device=device,
+            dtype=dtype,
+        )
+
+        new_q.weight.copy_(q.weight.detach()[rows, :])
+        if new_q.bias is not None and q.bias is not None:
+            new_q.bias.copy_(q.bias.detach()[rows])
+
+        new_k.weight.copy_(k.weight.detach()[rows, :])
+        if new_k.bias is not None and k.bias is not None:
+            new_k.bias.copy_(k.bias.detach()[rows])
+
+        new_v.weight.copy_(v.weight.detach()[rows, :])
+        if new_v.bias is not None and v.bias is not None:
+            new_v.bias.copy_(v.bias.detach()[rows])
+
+        new_o.weight.copy_(o.weight.detach()[:, cols])
+        if new_o.bias is not None and o.bias is not None:
+            new_o.bias.copy_(o.bias.detach())
+
+        new_q.weight.requires_grad = q.weight.requires_grad
+        if new_q.bias is not None and q.bias is not None:
+            new_q.bias.requires_grad = q.bias.requires_grad
+        new_k.weight.requires_grad = k.weight.requires_grad
+        if new_k.bias is not None and k.bias is not None:
+            new_k.bias.requires_grad = k.bias.requires_grad
+        new_v.weight.requires_grad = v.weight.requires_grad
+        if new_v.bias is not None and v.bias is not None:
+            new_v.bias.requires_grad = v.bias.requires_grad
+        new_o.weight.requires_grad = o.weight.requires_grad
+        if new_o.bias is not None and o.bias is not None:
+            new_o.bias.requires_grad = o.bias.requires_grad
+
+        parent.q_proj = new_q
+        parent.k_proj = new_k
+        parent.v_proj = new_v
+        parent.o_proj = new_o
+        setattr(parent, "num_heads", int(keep_heads))
+        if hasattr(parent, "num_attention_heads"):
+            setattr(parent, "num_attention_heads", int(keep_heads))
+        if hasattr(parent, "head_dim"):
+            setattr(parent, "head_dim", int(head_dim))
+
+        changed += 1
+        block_orig = sum(_count_parameters(layer) for layer in (q, k, v, o))
+        block_new = sum(
+            _count_parameters(layer) for layer in (new_q, new_k, new_v, new_o)
+        )
+        orig_params += block_orig
+        new_params += block_new
+        info.append((name, num_heads, keep_heads))
+
+    return changed, orig_params, new_params, info
+
+
+@torch.no_grad()
 def _prune_mlp_neurons(
     module: nn.Module, energy_threshold: float
 ) -> Tuple[int, int, int, List[Tuple[str, int, int]]]:
@@ -255,6 +419,7 @@ def _svd_qk_product_per_head(
         r_list.append(r)
 
     if svd_fail:
+        print("SVD FAIL")
         return None
 
     r_total = int(sum(r_list))
@@ -277,6 +442,8 @@ def _svd_qk_product_per_head(
     new_params = new_q + new_k
 
     if new_params >= old_params:
+        print("FOOOOOOOOOOOOOO")
+        print(f"{r_total=}")
         # Not worth replacing for this block
         return None
 
@@ -551,15 +718,17 @@ def parse_args() -> argparse.Namespace:
         "--prune_method",
         type=str,
         default="none",
-        help="Pruning method to apply (supported: none, truncated_svd, mlp_neurons, qk_product).",
+        help=(
+            "Pruning method to apply (supported: none, truncated_svd, attention_heads, "
+            "mlp_neurons, qk_product)."
+        ),
     )
     parser.add_argument(
         "--prune_amount",
         type=float,
         default=0.95,
         help=(
-            "Energy threshold for truncated SVD (keep this fraction of squared singular "
-            "values)."
+            "Energy threshold for energy-based pruning (fraction of squared norm to keep)."
         ),
     )
     parser.add_argument(
@@ -802,6 +971,26 @@ def apply_pruning(
             print(f"  - {name}: ({out_feats}×{in_feats}) → rank {rank} factorization")
         if len(details) > 5:
             print(f"    … {len(details) - 5} additional layers compressed")
+        return
+
+    if method in {"attention_heads", "attn_heads", "attention", "head_prune"}:
+        changed, original_params, compressed_params, details = _prune_attention_heads(
+            model, threshold
+        )
+        if changed == 0:
+            print(
+                "[info] Attention head pruning did not modify any blocks (try lowering the threshold)."
+            )
+            return
+
+        reduction = 1.0 - (compressed_params / max(1, original_params))
+        print(
+            f"Pruned attention heads in {changed} blocks; params {original_params} → {compressed_params} ({reduction:.1%} reduction)."
+        )
+        for name, prev_heads, kept_heads in details[:5]:
+            print(f"  - {name}: heads {prev_heads} → {kept_heads}")
+        if len(details) > 5:
+            print(f"    … {len(details) - 5} additional attention blocks pruned")
         return
 
     if method in {"mlp", "mlp_neurons", "mlp-prune", "mlp-neurons"}:
