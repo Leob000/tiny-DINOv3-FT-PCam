@@ -1,14 +1,18 @@
 make seval CHECKPOINT=fullft.pt \
-  WANDB_RUN_NAME=eval_fullft_attn0.80 \
-  PRUNE_AMOUNT=0.80 PRUNE_TARGETS=all PRUNE_METHOD=attention_heads
+  WANDB_RUN_NAME=eval_fullft_attn0.89 \
+  PRUNE_AMOUNT=0.89 PRUNE_TARGETS=all PRUNE_METHOD=attention_heads
 
 make seval CHECKPOINT=fullft.pt \
-  WANDB_RUN_NAME=eval_fullft_attn0.85 \
-  PRUNE_AMOUNT=0.85 PRUNE_TARGETS=all PRUNE_METHOD=attention_heads
+  WANDB_RUN_NAME=eval_fullft_attn0.88 \
+  PRUNE_AMOUNT=0.88 PRUNE_TARGETS=all PRUNE_METHOD=attention_heads
 
 make seval CHECKPOINT=fullft.pt \
-  WANDB_RUN_NAME=eval_fullft_attn0.90 \
-  PRUNE_AMOUNT=0.90 PRUNE_TARGETS=all PRUNE_METHOD=attention_heads
+  WANDB_RUN_NAME=eval_fullft_attn0.87 \
+  PRUNE_AMOUNT=0.87 PRUNE_TARGETS=all PRUNE_METHOD=attention_heads
+
+make seval CHECKPOINT=fullft.pt \
+  WANDB_RUN_NAME=eval_fullft_attn0.86 \
+  PRUNE_AMOUNT=0.86 PRUNE_TARGETS=all PRUNE_METHOD=attention_heads
 
 ###
 
