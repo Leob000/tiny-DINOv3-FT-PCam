@@ -1,21 +1,21 @@
 [project]
-name = "dinov3-pcam-compress"
+name = "tiny-DINOv3-FT-PCam"
 version = "0.1.0"
-description = "Add your description here"
+description = "Finetuning then pruning of a backbone DINOv3 on the histology PCam dataset"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "gdown>=5.2.0",
-    "h5py>=3.14.0",
-    "huggingface-hub>=0.34.4",
-    "matplotlib>=3.10.6",
-    "pillow>=11.3.0",
-    "ptflops>=0.7.5",
-    "safetensors>=0.6.2",
-    "scikit-learn>=1.7.2",
-    "torch>=2.8.0",
-    "torchvision>=0.23.0",
-    "transformers>=4.56",
-    "uv>=0.8.17",
-    "wandb>=0.21.3",
+  "gdown>=5.2.0",
+  "h5py>=3.14.0",
+  "huggingface-hub>=0.34.4",
+  "matplotlib>=3.10.6",
+  "pillow>=11.3.0",
+  "ptflops>=0.7.5",
+  "safetensors>=0.6.2",
+  "scikit-learn>=1.7.2",
+  "torch>=2.8.0",
+  "torchvision>=0.23.0",
+  "transformers>=4.56",
+  "uv>=0.8.17",
+  "wandb>=0.21.3",
 ]
