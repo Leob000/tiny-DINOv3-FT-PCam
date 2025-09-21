@@ -706,8 +706,8 @@ def extract_training_metadata(
     ckpt_model_id = None
     ckpt_resolution = None
     if isinstance(ckpt_args, dict):
-        ckpt_model_id = ckpt_args.get("model_id")
-        ckpt_resolution = ckpt_args.get("resolution")
+        ckpt_model_id = ckpt_args.get("model_id")  # type:ignore
+        ckpt_resolution = ckpt_args.get("resolution")  # type:ignore
     backbone_model_id = (
         payload.get("backbone_model_id") if isinstance(payload, dict) else None
     )
@@ -822,7 +822,7 @@ def load_model(
     # warn if run trained norms/bias but no overrides are present
     ck_args = payload.get("args", {}) if isinstance(payload, dict) else {}
     tn_mode = (
-        ck_args.get("train_norms_bias", "none") if isinstance(ck_args, dict) else "none"
+        ck_args.get("train_norms_bias", "none") if isinstance(ck_args, dict) else "none"  # type:ignore
     )
     overrides = payload.get("backbone_overrides", {})
 
