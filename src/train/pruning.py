@@ -14,6 +14,7 @@ from src.utils.eval_utils import (
     collect_binary_predictions,
     get_device,
     evaluate_loss,
+    try_flops,
 )
 from src.utils.metrics import eval_binary_scores
 
@@ -732,6 +733,11 @@ def parse_args() -> argparse.Namespace:
             "name or the checkpoint stem."
         ),
     )
+    parser.add_argument(
+        "--compute_flops",
+        action="store_true",
+        help="Compute GFLOPs (ptflops).",
+    )
     return parser.parse_args()
 
 
@@ -1155,6 +1161,17 @@ def main() -> None:
         print(f"Parameter difference (before - after): {params_diff:+,}")
         print(f"Parameter reduction: {params_percent_diff:.1%}")
 
+        flops = None
+        if getattr(args, "compute_flops", False):
+            print("Computing FLOPs...")
+            flops = try_flops(model, img_size=image_size, device=device)
+            if flops is None:
+                print(
+                    "[warn] FLOPs computation failed or ptflops not installed. FLOPs set to N/A."
+                )
+            else:
+                print(f"FLOPs after pruning (G): {flops:.4f}")
+
         criterion = nn.CrossEntropyLoss()
         eval_limit = max(0, int(args.max_eval_batches))
 
@@ -1250,12 +1267,18 @@ def main() -> None:
             }
         )
 
+        if getattr(args, "compute_flops", False):
+            wandb_log["model/gflops"] = (
+                float(flops) if flops is not None else float("nan")
+            )
+
         summary_payload = {k: v for k, v in wandb_log.items() if k != "global_step"}
         summary_payload.update(
             {
                 "val/max_eval_batches": float(eval_limit),
                 "test/max_eval_batches": float(eval_limit),
                 "eval/tta_enabled": float(args.tta_eval),
+                "model/gflops": float(flops) if flops is not None else float("nan"),
             }
         )
         log_wandb_metrics(wandb_module, wandb_run, wandb_log, summary_payload)

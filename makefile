@@ -39,6 +39,7 @@ CHECKPOINT?=lora.pt
 PRUNE_METHOD?=attention_heads
 PRUNE_AMOUNT?=0.8
 PRUNE_TARGETS?=all
+COMPUTE_FLOPS=--compute_flops
 WANDB_RUN_NAME?=eval_run
 
 eval:
@@ -49,7 +50,8 @@ eval:
 		--resolution $(RESOLUTION) \
 		--val_batch_size $(VAL_BATCH_SIZE) \
 		--num_workers $(NUM_WORKERS) \
-	--prune_method $(PRUNE_METHOD) --prune_amount $(PRUNE_AMOUNT) --prune_targets $(PRUNE_TARGETS) \
+		--prune_method $(PRUNE_METHOD) --prune_amount $(PRUNE_AMOUNT) --prune_targets $(PRUNE_TARGETS) \
+		$(COMPUTE_FLOPS) \
 		--tta_eval
 
 baseline:
@@ -146,6 +148,7 @@ COMMON2 = $(PY) -m src.train.pruning \
 	--val_batch_size $(VAL_BATCH_SIZE) \
 	--num_workers $(NUM_WORKERS) \
 	--prune_method $(PRUNE_METHOD) --prune_amount $(PRUNE_AMOUNT) --prune_targets $(PRUNE_TARGETS) \
+	$(COMPUTE_FLOPS) \
 	--tta_eval
 
 .PHONY: common common2
