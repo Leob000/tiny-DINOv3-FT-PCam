@@ -1,13 +1,21 @@
 import argparse
+import csv
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 from src.models.backbone_dinov3 import DinoV3Backbone, DinoV3PCam
 from src.models.lora import LoRALinear, inject_lora
 from src.utils.data_utils import build_eval_loaders
-from src.utils.eval_utils import evaluate, get_device, evaluate_loss
+from src.utils.eval_utils import (
+    collect_binary_predictions,
+    get_device,
+    evaluate_loss,
+)
+from src.utils.metrics import eval_binary_scores
 
 DEFAULT_MODEL_ID = "facebook/dinov3-vits16-pretrain-lvd1689m"
 DEFAULT_IMAGE_SIZE = 224
@@ -27,6 +35,43 @@ PRUNE_METHOD_ALIASES = {
     "attention_heads": {"attention_heads", "attn_heads", "attention", "head_prune"},
     "mlp_neurons": {"mlp_neurons", "mlp", "mlp-prune", "mlp-neurons"},
 }
+
+RESULTS_FIELDNAMES = [
+    "run_name",
+    "split",
+    "sample_index",
+    "label",
+    "probability",
+    "checkpoint",
+    "prune_method",
+    "prune_amount",
+    "prune_targets",
+    "tta_eval",
+    "max_eval_batches",
+]
+
+
+def _compute_metrics_from_probs(
+    probs: np.ndarray, labels: np.ndarray
+) -> Dict[str, float]:
+    if probs.size == 0 or labels.size == 0:
+        probs = np.array([0.5], dtype=np.float32)
+        labels = np.array([0], dtype=np.int64)
+    return eval_binary_scores(probs, labels)
+
+
+def _append_results_rows(csv_path: Path, rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    need_header = not csv_path.exists()
+
+    with csv_path.open("a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=RESULTS_FIELDNAMES)
+        if need_header:
+            writer.writeheader()
+        writer.writerows(rows)
 
 
 def _canonicalize_prune_method(raw: str) -> str:
@@ -672,6 +717,21 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="eval_run",
     )
+    parser.add_argument(
+        "--results_csv",
+        type=str,
+        default="results_probs.csv",
+        help="CSV file to append per-sample test predictions.",
+    )
+    parser.add_argument(
+        "--results_run_name",
+        type=str,
+        default=None,
+        help=(
+            "Run identifier stored with exported probabilities; defaults to the W&B run "
+            "name or the checkpoint stem."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1111,28 +1171,65 @@ def main() -> None:
         print(f"Test loss: {test_loss:.4f}")
 
         print("Running full metric evaluation (validation)...")
-        val_metrics = evaluate(
+        val_probs, val_labels, _ = collect_binary_predictions(
             model,
             val_loader,
             device,
             max_batches=eval_limit,
             use_tta=args.tta_eval,
         )
+        val_metrics = _compute_metrics_from_probs(val_probs, val_labels)
         print("Validation metrics:")
         for key, value in val_metrics.items():
             print(f"  {key}: {value:.4f}")
 
         print("Running full metric evaluation (test)...")
-        test_metrics = evaluate(
+        test_probs, test_labels, test_indices = collect_binary_predictions(
             model,
             test_loader,
             device,
             max_batches=eval_limit,
             use_tta=args.tta_eval,
         )
+        test_metrics = _compute_metrics_from_probs(test_probs, test_labels)
         print("Test metrics:")
         for key, value in test_metrics.items():
             print(f"  {key}: {value:.4f}")
+
+        run_name = args.results_run_name
+        if not run_name:
+            if args.wandb_run_name and args.wandb_run_name != "eval_run":
+                run_name = args.wandb_run_name
+            else:
+                run_name = Path(checkpoint_path).stem
+
+        results_csv = Path(args.results_csv)
+        rows: List[Dict[str, Any]] = []
+        if test_probs.size > 0 and test_labels.size > 0:
+            for idx, label, prob in zip(
+                test_indices.tolist(),
+                test_labels.tolist(),
+                test_probs.tolist(),
+            ):
+                rows.append(
+                    {
+                        "run_name": run_name,
+                        "split": "test",
+                        "sample_index": int(idx),
+                        "label": int(label),
+                        "probability": float(prob),
+                        "checkpoint": checkpoint_path,
+                        "prune_method": args.prune_method,
+                        "prune_amount": args.prune_amount,
+                        "prune_targets": args.prune_targets,
+                        "tta_eval": int(bool(args.tta_eval)),
+                        "max_eval_batches": int(eval_limit),
+                    }
+                )
+
+        _append_results_rows(results_csv, rows)
+        if rows:
+            print(f"Appended {len(rows)} test predictions to '{results_csv}'.")
 
         wandb_log: Dict[str, float] = {
             "global_step": 0.0,

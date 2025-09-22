@@ -1,10 +1,12 @@
+# WANDB_RUN_NAME=eval_lora_attn-mlp-tsvd_0.89-0.975-0.975 \
 make seval CHECKPOINT=lora.pt \
-  WANDB_RUN_NAME=eval_lora_attn-mlp-tsvd_0.89-0.975-0.975 \
+  WANDB_RUN_NAME=test_csv_lora \
   PRUNE_TARGETS=all PRUNE_METHOD=attention_heads,mlp_neurons,truncated_svd \
   PRUNE_AMOUNT=attention_heads=0.89,mlp_neurons=0.975,truncated_svd=0.975
 
+# WANDB_RUN_NAME=eval_head_only_attn-mlp-tsvd_0.89-0.975-0.975 \
 make seval CHECKPOINT=head_only.pt \
-  WANDB_RUN_NAME=eval_head_only_attn-mlp-tsvd_0.89-0.975-0.975 \
+  WANDB_RUN_NAME=test_csv_head_only \
   PRUNE_TARGETS=all PRUNE_METHOD=attention_heads,mlp_neurons,truncated_svd \
   PRUNE_AMOUNT=attention_heads=0.89,mlp_neurons=0.975,truncated_svd=0.975
 

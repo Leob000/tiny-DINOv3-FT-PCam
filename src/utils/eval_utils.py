@@ -1,7 +1,7 @@
 # src/utils/eval_utils.py
 from __future__ import annotations
 import time
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 
 import numpy as np
 import torch
@@ -79,6 +79,49 @@ def predict_tta(model: nn.Module, x: torch.Tensor, device: str) -> torch.Tensor:
 
 
 @torch.no_grad()
+def collect_binary_predictions(
+    model: nn.Module,
+    loader,
+    device: str,
+    max_batches: int = 0,
+    use_tta: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Return per-sample probabilities, labels, and sequential indices for a loader.
+    """
+
+    model.eval()
+    probs: List[np.ndarray] = []
+    labels: List[np.ndarray] = []
+    indices: List[np.ndarray] = []
+    iters = 0
+    offset = 0
+
+    for x, y in loader:
+        if use_tta:
+            batch_probs = predict_tta(model, x, device).cpu().numpy()
+        else:
+            batch_probs = _predict_proba(model, x, device).cpu().numpy()
+        batch_labels = y.numpy()
+        batch_size = batch_labels.shape[0]
+        batch_indices = np.arange(offset, offset + batch_size, dtype=np.int64)
+
+        probs.append(batch_probs)
+        labels.append(batch_labels)
+        indices.append(batch_indices)
+
+        offset += batch_size
+        iters += 1
+        if max_batches and iters >= max_batches:
+            break
+
+    p = np.concatenate(probs) if probs else np.empty((0,), dtype=np.float32)
+    y = np.concatenate(labels) if labels else np.empty((0,), dtype=np.int64)
+    idx = np.concatenate(indices) if indices else np.empty((0,), dtype=np.int64)
+    return p, y, idx
+
+
+@torch.no_grad()
 def evaluate(
     model: nn.Module,
     loader,
@@ -89,22 +132,13 @@ def evaluate(
     """
     Full metrics pass on a loader. Uses your eval_binary_scores() util.
     """
-    model.eval()
-    probs, labels = [], []
-    iters = 0
-    for x, y in loader:
-        if use_tta:
-            p = predict_tta(model, x, device).cpu().numpy()
-        else:
-            p = _predict_proba(model, x, device).cpu().numpy()
-        probs.append(p)
-        labels.append(y.numpy())
-        iters += 1
-        if max_batches and iters >= max_batches:
-            break
-
-    p = np.concatenate(probs) if probs else np.array([0.5], dtype=np.float32)
-    y = np.concatenate(labels) if labels else np.array([0], dtype=np.int64)
+    p, y, _ = collect_binary_predictions(
+        model, loader, device, max_batches=max_batches, use_tta=use_tta
+    )
+    if p.size == 0 or y.size == 0:
+        # align with previous fallback behaviour when loader was empty
+        p = np.array([0.5], dtype=np.float32)
+        y = np.array([0], dtype=np.int64)
     return eval_binary_scores(p, y)
 
 
