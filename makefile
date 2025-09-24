@@ -34,6 +34,7 @@ VAL_FLAGS=--val_mid_epoch --val_epoch_end --val_heavy_end
 VAL_FLAGS_HUGE=--val_mid_epoch --val_epoch_end --val_heavy_end --val_heavy_mid
 VAL_FLAGS_NO_MID=--val_epoch_end --val_heavy_end
 TRAIN_NORMS_BIAS?=none # [none, norms, bias, both] train the LayerNorms params for head_only/LoRA methods
+QUANTIZE?=none #[none, int8, bf16]
 
 CHECKPOINT?=lora.pt
 PRUNE_METHOD?=attention_heads
@@ -52,6 +53,7 @@ eval:
 		--num_workers $(NUM_WORKERS) \
 		--prune_method $(PRUNE_METHOD) --prune_amount $(PRUNE_AMOUNT) --prune_targets $(PRUNE_TARGETS) \
 		$(COMPUTE_FLOPS) \
+		--quantize $(QUANTIZE) \
 		--tta_eval
 
 baseline:
@@ -149,6 +151,7 @@ COMMON2 = $(PY) -m src.train.pruning \
 	--num_workers $(NUM_WORKERS) \
 	--prune_method $(PRUNE_METHOD) --prune_amount $(PRUNE_AMOUNT) --prune_targets $(PRUNE_TARGETS) \
 	$(COMPUTE_FLOPS) \
+	--quantize $(QUANTIZE) \
 	--tta_eval
 
 .PHONY: common common2

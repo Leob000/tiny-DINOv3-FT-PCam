@@ -7,15 +7,17 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+
 from src.models.backbone_dinov3 import DinoV3Backbone, DinoV3PCam
 from src.models.lora import LoRALinear, inject_lora
 from src.utils.data_utils import build_eval_loaders
 from src.utils.eval_utils import (
     collect_binary_predictions,
-    get_device,
     evaluate_loss,
+    get_device,
     try_flops,
 )
+from src.utils.memory_utils import apply_quantization, pretty_bytes, state_dict_nbytes
 from src.utils.metrics import eval_binary_scores
 
 DEFAULT_MODEL_ID = "facebook/dinov3-vits16-pretrain-lvd1689m"
@@ -738,6 +740,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Compute GFLOPs (ptflops).",
     )
+    parser.add_argument(
+        "--quantize",
+        type=str,
+        default="none",
+        choices=["none", "int8", "bf16"],
+        help="Optional post-pruning quantization: 'int8' (dynamic PTQ on CPU) or 'bf16' (weights cast + input autocast wrapper).",
+    )
+
     return parser.parse_args()
 
 
@@ -1161,6 +1171,33 @@ def main() -> None:
         print(f"Parameter difference (before - after): {params_diff:+,}")
         print(f"Parameter reduction: {params_percent_diff:.1%}")
 
+        # Quantization
+        mem_bytes = 0
+        if args.quantize and args.quantize.lower() != "none":
+            print(f"Applying quantization: {args.quantize}")
+            model, device, _ = apply_quantization(model, args.quantize.lower(), device)
+            print(f"Quantization applied. Evaluation device now: {device}")
+
+            # Log memory footprint of the quantized model's state_dict
+            try:
+                mem_bytes = state_dict_nbytes(model)
+                print(
+                    f"State dict size after quantization: {pretty_bytes(mem_bytes)} ({mem_bytes:,} bytes)"
+                )
+            except Exception as e:
+                print(
+                    f"[warn] Could not compute state_dict size after quantization: {e}"
+                )
+        else:
+            # Even when not quantizing, reporting the (post-prune) state_dict size is useful
+            try:
+                mem_bytes = state_dict_nbytes(model)
+                print(
+                    f"State dict size (post-prune): {pretty_bytes(mem_bytes)} ({mem_bytes:,} bytes)"
+                )
+            except Exception as e:
+                print(f"[warn] Could not compute state_dict size: {e}")
+
         flops = None
         if getattr(args, "compute_flops", False):
             print("Computing FLOPs...")
@@ -1282,6 +1319,14 @@ def main() -> None:
                 "model/gflops": float(flops) if flops is not None else float("nan"),
             }
         )
+
+        # Track state_dict size and quantization mode in W&B (if enabled)
+        if "mem_bytes" in locals():
+            wandb_log["model/state_bytes"] = float(mem_bytes)
+            summary_payload["model/state_bytes"] = float(mem_bytes)
+        wandb_log["model/quantization"] = args.quantize
+        summary_payload["model/quantization"] = args.quantize
+
         log_wandb_metrics(wandb_module, wandb_run, wandb_log, summary_payload)
     finally:
         finalize_wandb(wandb_module)
