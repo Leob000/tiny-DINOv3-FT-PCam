@@ -721,7 +721,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--results_csv",
         type=str,
-        default="results_probs.csv",
+        default="reports/results_probs.csv",
         help="CSV file to append per-sample test predictions.",
     )
     parser.add_argument(
@@ -1221,6 +1221,7 @@ def main() -> None:
                 run_name = Path(checkpoint_path).stem
 
         results_csv = Path(args.results_csv)
+        results_csv.parent.mkdir(parents=True, exist_ok=True)
         rows: List[Dict[str, Any]] = []
         if test_probs.size > 0 and test_labels.size > 0:
             for idx, label, prob in zip(

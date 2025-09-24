@@ -173,11 +173,11 @@ def plot_roc_curves(
 if __name__ == "__main__":
     import sys
 
-    # Default to ./results.csv if no argument is given
+    # Default to reports/results_probs.csv if no argument is given
     if len(sys.argv) < 2:
-        csv_path = "results.csv"
-        print("No CSV path provided. Using default: results.csv")
+        csv_path = "reports/results_probs.csv"
+        print("No CSV path provided. Using default: reports/results_probs.csv")
     else:
         csv_path = sys.argv[1]
-    plot_roc_curves(csv_path, output_path="roc_curve.pdf")
+    plot_roc_curves(csv_path, output_path="reports/roc_curve.pdf")
     plt.show()
