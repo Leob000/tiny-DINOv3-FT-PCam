@@ -220,8 +220,10 @@ def plot_roc_curves(
     if output_path is not None:
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(output_file, bbox_inches="tight")
-
+    base = output_file.with_suffix("")
+    for ext in (".pdf", ".svg", ".png"):
+        target = base.with_suffix(ext)
+        fig.savefig(target, bbox_inches="tight")
     return ax
 
 

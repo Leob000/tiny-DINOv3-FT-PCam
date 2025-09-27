@@ -1,3 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "Usage: $0 [--wandb]" >&2
+}
+
+USE_WANDB=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --wandb)
+    USE_WANDB=true
+    shift
+    ;;
+  -h | --help)
+    usage
+    exit 0
+    ;;
+  *)
+    echo "Unknown option: $1" >&2
+    usage
+    exit 1
+    ;;
+  esac
+done
+
+if $USE_WANDB; then
+  export WANDB="--wandb"
+else
+  export WANDB=""
+fi
+
 make sbaseline METHOD=head_only \
   WARMUP_STEPS=400 \
   TRAIN_NORMS_BIAS=both LR_HEAD=2.5e-4 LR_NORMS_BIAS=1e-4 \

@@ -4,6 +4,18 @@ PY=python
 DATA_DIR=src/data/pcam
 MODEL_ID=facebook/dinov3-vits16-pretrain-lvd1689m # Backbone model
 
+# Cluster-specific overrides
+CLUSTER_BASHRC?=$(HOME)/.bashrc # path to bashrc to source on cluster (set empty to skip)
+CLUSTER_DIR?=$(HOME)/Tiny-DINOv3-PCam  # project path on the cluster
+VENV?=.venv  # virtualenv path relative to $(CLUSTER_DIR)
+CLUSTER_ACTIVATE?=source $(VENV)/bin/activate  # command to activate environment on cluster
+
+# Sanitize accidental padding/trailing spaces from variables above
+CLUSTER_BASHRC := $(strip $(CLUSTER_BASHRC))
+CLUSTER_DIR := $(strip $(CLUSTER_DIR))
+VENV := $(strip $(VENV))
+CLUSTER_ACTIVATE := $(strip $(CLUSTER_ACTIVATE))
+
 # Download PCam, run once before other commands
 get-data:
 	$(PY) -m scripts.download_pcam --out $(DATA_DIR)
@@ -117,7 +129,7 @@ SBATCH = sbatch \
 	--nodes=1 \
 	--ntasks-per-node=1
 
-COMMON = $(PY) -m src.train.finetune \
+CLUSTER_TRAIN = $(PY) -m src.train.finetune \
   --data_dir $(DATA_DIR) \
   --model_id $(MODEL_ID) \
   --select_metric $(SELECT_METRIC) \
@@ -140,7 +152,7 @@ COMMON = $(PY) -m src.train.finetune \
 	--aug_histology --tta_eval \
   --save_best
 
-COMMON2 = $(PY) -m src.train.pruning \
+CLUSTER_PRUNE = $(PY) -m src.train.pruning \
 	--checkpoint $(CHECKPOINT) \
   $(WANDB) --wandb_project dinov3-pcam-compress \
 	--wandb_run_name $(WANDB_RUN_NAME) \
@@ -154,26 +166,22 @@ COMMON2 = $(PY) -m src.train.pruning \
 	--quantize $(QUANTIZE) \
 	--tta_eval
 
-.PHONY: common common2
-
-# Where the project & venv live on the cluster
-CLUSTER_DIR ?= $(HOME)/Tiny-DINOv3-PCam
-VENV ?= .venv
+.PHONY: cluster_train clustser_prune
 
 define WRAP_CMD
-bash -lc "source /home/tau/lburgund/.bashrc; \
-  cd $(CLUSTER_DIR); \
-  source $(VENV)/bin/activate; \
+bash -lc 'if [ -n "$(CLUSTER_BASHRC)" ] && [ -f "$(CLUSTER_BASHRC)" ]; then source "$(CLUSTER_BASHRC)"; fi; \
+  cd "$(CLUSTER_DIR)"; \
+  $(CLUSTER_ACTIVATE); \
   which python; python --version; \
   echo Running on partition: $$SLURM_JOB_PARTITION; \
   echo Running: $(1); \
-  $(1)"
+  $(1)'
 endef
 
 sbaseline:
 	mkdir -p slurm
-	$(SBATCH) --wrap='$(call WRAP_CMD,$(COMMON))'
+	$(SBATCH) --wrap="$(call WRAP_CMD,$(CLUSTER_TRAIN))"
 
 seval:
 	mkdir -p slurm
-	$(SBATCH) --wrap='$(call WRAP_CMD,$(COMMON2))'
+	$(SBATCH) --wrap="$(call WRAP_CMD,$(CLUSTER_PRUNE))"

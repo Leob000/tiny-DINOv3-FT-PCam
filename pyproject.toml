@@ -1,7 +1,7 @@
 [project]
 name = "tiny-DINOv3-FT-PCam"
 version = "0.1.0"
-description = "Finetuning then pruning of a backbone DINOv3 on the histology PCam dataset"
+description = "Fine-tuning, pruning and quantization of a backbone DINOv3 on the histology PCam dataset."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
