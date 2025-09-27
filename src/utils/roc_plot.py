@@ -62,6 +62,9 @@ def load_run_probabilities(
             run_name = row.get("run_name")
             if not run_name:
                 continue
+            # Ignore runs that containing some word
+            if any(word in run_name.lower() for word in ("int8", "bf16")):
+                continue
             if requested is not None and run_name not in requested:
                 continue
 
@@ -125,7 +128,9 @@ def plot_roc_curves(
         fig = ax.figure
 
     plotted = False
-    for run_name in sorted(runs):
+    # Collect plotted lines with their AUC so we can sort the legend by AUC later.
+    plotted_entries = []  # list of tuples (auc, Line2D)
+    for idx, run_name in enumerate(sorted(runs)):
         probs, labels = runs[run_name]
         if probs.size == 0:
             continue
@@ -138,28 +143,78 @@ def plot_roc_curves(
 
         fpr, tpr, _ = roc_curve(labels, probs)
         roc_auc = auc(fpr, tpr)
-        ax.plot(fpr, tpr, label=f"{run_name} (AUC={roc_auc:.3f})")
-        plotted = True
+        # Cycle through linestyles/markers so overlapping curves are distinguishable.
+        linestyles = ["-", "--", "-.", ":"]
+        markers = [None, "o", "s", "D"]
+        ls = linestyles[idx % len(linestyles)]
+        marker = markers[idx % len(markers)]
+        markevery = max(1, len(fpr) // 20)
 
+        # Better labels for common run types
+        lowered = run_name.lower()
+        if lowered.startswith("eval_fullft"):
+            base_label = "Full fine-tune"
+        elif lowered.startswith("eval_lora"):
+            base_label = "LoRA"
+        elif lowered.startswith("eval_head_only"):
+            base_label = "Head-only"
+        else:
+            base_label = run_name
+
+        if "noprune" in lowered:
+            prune_label = "no pruning"
+        elif any(k in lowered for k in ("attn-mlp", "tsvd", "prune")):
+            prune_label = "pruned"
+        else:
+            prune_label = None
+
+        nice_label = f"{base_label}, {prune_label}" if prune_label else base_label
+
+        (line,) = ax.plot(
+            fpr,
+            tpr,
+            # label=f"{run_name} (AUC={roc_auc:.3f})",
+            label=f"(AUC={roc_auc:.3f}) " + nice_label,
+            linestyle=ls,
+            marker=marker,
+            markevery=markevery,
+            markersize=4,
+            linewidth=1.25,
+            alpha=0.8,
+        )
+        plotted_entries.append((roc_auc, line))
+        plotted = True
     if not plotted:
         raise ValueError(
             "Unable to plot ROC curves because no run had both positive and negative samples."
         )
 
-    ax.plot(
+    (baseline_line,) = ax.plot(
         [0.0, 1.0],
         [0.0, 1.0],
         linestyle="--",
         color="grey",
-        linewidth=1.0,
         label="baseline",
     )
     ax.set_xlim(0.0, 1.0)
     ax.set_ylim(0.0, 1.0)
+    # Ensure the ROC plot uses equal scaling on X and Y so the plotted area is square.
+    if hasattr(ax, "set_box_aspect"):
+        try:
+            ax.set_box_aspect(1.0)
+        except Exception:
+            ax.set_aspect("equal", adjustable="box")
+    else:
+        ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("False Positive Rate")
     ax.set_ylabel("True Positive Rate")
-    ax.set_title(title or f"ROC Curves ({split})")
-    ax.legend(loc="lower right")
+    ax.set_title(title or f"ROC Curves ({split} set, no quantization)")
+    # Sort legend entries by AUC (descending) so highest AUC appears at the top.
+    # Keep the baseline entry at the bottom.
+    plotted_entries.sort(key=lambda t: t[0], reverse=True)
+    handles = [entry[1] for entry in plotted_entries]
+    labels = [h.get_label() for h in handles]
+    ax.legend(handles=handles, labels=labels, loc="lower right")
     ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
 
     if output_path is not None:
